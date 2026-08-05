@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Edge Verify — local test</title></head>
+<body style="font-family: sans-serif; max-width: 40rem; margin: 3rem auto;">
+  <h1>Edge Verify — local test</h1>
+  <p>Open DevTools → Network. On load you should see POSTs to
+     <code>/__apx_verify/challenge</code> then <code>/__apx_verify/token</code>,
+     and a hidden <code>_apx_verify_token</code> field appear inside the form.
+     Submitting should show "FORM ACCEPTED BY ORIGIN".</p>
+  <form method="post" action="/form">
+    <input type="text" name="email" placeholder="email" style="font-size:16px;padding:.4rem">
+    <button type="submit" style="font-size:16px;padding:.4rem .8rem">Submit</button>
+  </form>
+  <script src="/__apx_verify/widget.js" defer></script>
+</body>
+</html>

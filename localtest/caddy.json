@@ -1,0 +1,39 @@
+{
+  "admin": { "disabled": false, "listen": "localhost:2019" },
+  "apps": {
+    "apx_challenge": {
+      "secret": "local-test-secret-change-me",
+      "difficulty": 12,
+      "verify_path": "/__apx_challenge/verify",
+      "verify_difficulty": 12,
+      "verify_token_ttl_seconds": 600,
+      "verify_scoring": "off",
+      "verify_body_cap_bytes": 1048576
+    },
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":8899"],
+          "routes": [
+            {
+              "match": [{ "path": ["/__apx_verify/widget.js", "/__apx_verify/challenge", "/__apx_verify/token"] }],
+              "handle": [{ "handler": "apx_verify_endpoints" }],
+              "terminal": true
+            },
+            {
+              "match": [{ "method": ["POST"], "path": ["/form", "/form/*"] }],
+              "handle": [
+                { "handler": "apx_verify", "mode": "enforce" },
+                { "handler": "static_response", "status_code": 200, "body": "FORM ACCEPTED BY ORIGIN\n" }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [{ "handler": "file_server", "root": "./www" }]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@ package apxchallenge
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
@@ -21,6 +22,13 @@ type AppRef interface {
 	Secret() string
 	Difficulty() int
 	VerifyPath() string
+	VerifyDifficulty() int
+	VerifyTokenTTL() time.Duration
+	VerifyScoring() string
+	VerifyBodyCap() int64
+	// ReplayLRU is the process-wide, app-owned set of recently-seen verify-token
+	// nonces. Shared across all verify routes so a token is single-use per machine.
+	ReplayLRU() *NonceLRU
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -36,11 +44,42 @@ type ChallengeApp struct {
 	SecretCfg     string `json:"secret,omitempty"`
 	VerifyPathCfg string `json:"verify_path,omitempty"`
 
+	// VerifyDifficultyCfg / VerifyTokenTTLSecondsCfg / VerifyScoringCfg /
+	// VerifyBodyCapBytesCfg carry the Edge Verify config keys verify_difficulty /
+	// verify_token_ttl_seconds / verify_scoring / verify_body_cap_bytes. Same
+	// *Cfg-suffix convention as above.
+	VerifyDifficultyCfg      int    `json:"verify_difficulty,omitempty"`
+	VerifyTokenTTLSecondsCfg int    `json:"verify_token_ttl_seconds,omitempty"`
+	VerifyScoringCfg         string `json:"verify_scoring,omitempty"`
+	VerifyBodyCapBytesCfg    int64  `json:"verify_body_cap_bytes,omitempty"`
+
+	// DEPRECATED, ignored. The too_fast/fill_ms scoring it fed was removed (it
+	// blocked every real invisible-widget mint — fill_ms is just PoW-solve time).
+	// The field is retained ONLY so this binary still accepts a stored config
+	// blob that predates the removal: Caddy strict-unmarshals (DisallowUnknownFields)
+	// at machine boot, so an unknown key would crash-loop the machine, not just
+	// reject a /load. Phoenix no longer emits the key, but a deploy does NOT
+	// regenerate stored config blobs — drop this field only after verifying no
+	// cluster's stored config blob still contains verify_min_fill_ms (grep the
+	// stored blobs; force-regen any lingering cluster first), not after some
+	// number of releases.
+	VerifyMinFillMsCfg int64 `json:"verify_min_fill_ms,omitempty"`
+
 	logger     *zap.Logger
 	secret     string
 	difficulty int
 	verifyPath string
+
+	verifyDifficulty int
+	verifyTokenTTL   time.Duration
+	verifyScoring    string
+	verifyBodyCap    int64
+	replayLRU        *NonceLRU
 }
+
+// defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
+// single-use — cluster-wide uniqueness is not attempted.
+const defaultReplayLRUSize = 65536
 
 func (*ChallengeApp) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -64,6 +103,26 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.secret == "" {
 		return fmt.Errorf("apx_challenge app: secret is required (config key \"secret\")")
 	}
+
+	if a.verifyDifficulty = a.VerifyDifficultyCfg; a.verifyDifficulty <= 0 {
+		a.verifyDifficulty = 14
+	}
+	if s := a.VerifyTokenTTLSecondsCfg; s > 0 {
+		a.verifyTokenTTL = time.Duration(s) * time.Second
+	} else {
+		a.verifyTokenTTL = 600 * time.Second
+	}
+	switch a.VerifyScoringCfg {
+	case "off", "lenient", "strict":
+		a.verifyScoring = a.VerifyScoringCfg
+	default:
+		a.verifyScoring = "lenient"
+	}
+	if a.verifyBodyCap = a.VerifyBodyCapBytesCfg; a.verifyBodyCap <= 0 {
+		a.verifyBodyCap = 1 << 20
+	}
+	a.replayLRU = NewNonceLRU(defaultReplayLRUSize)
+
 	return nil
 }
 
@@ -73,6 +132,12 @@ func (a *ChallengeApp) Stop() error  { return nil }
 func (a *ChallengeApp) Secret() string     { return a.secret }
 func (a *ChallengeApp) Difficulty() int    { return a.difficulty }
 func (a *ChallengeApp) VerifyPath() string { return a.verifyPath }
+
+func (a *ChallengeApp) VerifyDifficulty() int         { return a.verifyDifficulty }
+func (a *ChallengeApp) VerifyTokenTTL() time.Duration { return a.verifyTokenTTL }
+func (a *ChallengeApp) VerifyScoring() string         { return a.verifyScoring }
+func (a *ChallengeApp) VerifyBodyCap() int64          { return a.verifyBodyCap }
+func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)
