@@ -531,7 +531,7 @@ func postVerify(t *testing.T, h *ChallengeHandler, tok, ip, ua string) *httptest
 }
 
 // postVerifyWith posts a solved challenge with extra request headers.
-func postVerifyWith(t *testing.T, h *ChallengeHandler, tok, ip, ua string, hdr map[string]string) *httptest.ResponseRecorder {
+func postVerifyWith(t *testing.T, h *ChallengeHandler, tok, ip, ua string, hdr map[string]string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
 	form := url.Values{"challenge": {tok}, "solution": {SolvePoW(tok, 8)}}
 	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
@@ -539,6 +539,9 @@ func postVerifyWith(t *testing.T, h *ChallengeHandler, tok, ip, ua string, hdr m
 	r.Header.Set("User-Agent", ua)
 	for k, v := range hdr {
 		r.Header.Set(k, v)
+	}
+	for _, c := range cookies {
+		r.AddCookie(c)
 	}
 	r.RemoteAddr = ip + ":443"
 	r = withVars(r)
@@ -680,4 +683,58 @@ func TestSolvedChallengeStaysSpentAcrossReprovision(t *testing.T) {
 	w = postVerify(t, &ChallengeHandler{app: a2}, tok, "203.0.113.5", "UA")
 	require.Equal(t, http.StatusForbidden, w.Code)
 	require.Nil(t, passCookieHeader(t, w))
+}
+
+var browserNav = map[string]string{"Sec-Fetch-Mode": "navigate", "Accept": "text/html"}
+
+func TestReplayedSolveTakesFailurePath(t *testing.T) {
+	pol := DefaultPassPolicy()
+	pol.IPv4Prefix = 32
+	h := policyHandler(pol)
+	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA", "/dest", time.Now().Add(challengeTokenTTL))
+	first := postVerify(t, h, tok, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusSeeOther, first.Code)
+	require.NotNil(t, passCookieHeader(t, first))
+
+	// Non-browser replay: bare 403, no counter, no cookie.
+	w := postVerify(t, h, tok, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Nil(t, passCookieHeader(t, w))
+	require.Nil(t, triesCookie(t, w))
+
+	// Browser replay: counted as a failure and sent back to a fresh challenge.
+	w = postVerifyWith(t, h, tok, "203.0.113.5", "UA", browserNav)
+	require.Equal(t, http.StatusSeeOther, w.Code)
+	require.Equal(t, "/dest", w.Header().Get("Location"))
+	require.Nil(t, passCookieHeader(t, w))
+	require.Equal(t, 1, triesOf(t, triesCookie(t, w)).Failed)
+	require.Equal(t, 0, triesOf(t, triesCookie(t, w)).Passed)
+
+	// At the threshold: the failed page, still no pass cookie.
+	w = postVerifyWith(t, h, tok, "203.0.113.5", "UA", browserNav, signedTries(triesState{Failed: maxVerifyTries - 1}))
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, w.Header().Get("Location"))
+	require.Equal(t, renderFailedPage("/dest", false), w.Body.String())
+	require.Nil(t, passCookieHeader(t, w))
+	require.Equal(t, maxVerifyTries, triesOf(t, triesCookie(t, w)).Failed)
+}
+
+func TestFailedPoWDoesNotSpendSolve(t *testing.T) {
+	pol := rollingPolicy()
+	h := policyHandler(pol)
+	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA", "/x", time.Now().Add(challengeTokenTTL))
+
+	form := url.Values{"challenge": {tok}, "solution": {"wrong"}}
+	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("Sec-Fetch-Mode", "cors")
+	r.RemoteAddr = "203.0.113.5:443"
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, withVars(r), nextOK))
+	require.Equal(t, http.StatusForbidden, w.Code)
+
+	// The correct solution still works: only a verified solve is recorded.
+	w = postVerify(t, h, tok, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusSeeOther, w.Code)
+	require.NotNil(t, passCookieHeader(t, w))
 }

@@ -101,8 +101,9 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	challenge := r.FormValue("challenge")
 	solution := r.FormValue("solution")
 
-	p, err := VerifyPassChallenge(h.app.Secret(), h.app.PassPolicy(), challenge, ip, r.UserAgent(), time.Now())
-	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) {
+	pol, now := h.app.PassPolicy(), time.Now()
+	p, err := VerifyPassChallenge(h.app.Secret(), pol, challenge, ip, r.UserAgent(), now)
+	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) || h.replayedSolve(pol, p) {
 		setOutcome(r, "failed")
 		if !isBrowserFormPost(r) {
 			w.WriteHeader(http.StatusForbidden)
@@ -124,14 +125,6 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		w.Header().Set("Cache-Control", "private, no-store")
 		w.Header().Set("Location", ret)
 		w.WriteHeader(http.StatusSeeOther)
-		return nil
-	}
-	pol, now := h.app.PassPolicy(), time.Now()
-	// Under a non-default policy a solved challenge is single-use per machine,
-	// so one solve can't mint a cookie per address or UA. Default stays as before.
-	if pol != DefaultPassPolicy() && h.app.ReplayLRU().Seen("chal:"+p.Nonce) {
-		setOutcome(r, "failed")
-		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
 	// The cap counts from the challenge's issue, so replaying a token can't reset it.
@@ -156,6 +149,15 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+// replayedSolve marks a verified solve as spent and reports whether it was
+// already spent. Under a non-default policy a solved challenge is single-use
+// per machine, so one solve can't mint a cookie per address or UA; a replay
+// takes the failure path (403, or the browser recovery redirect). The default
+// policy keeps solves reusable, as before.
+func (h *ChallengeHandler) replayedSolve(pol PassPolicy, p ChallengePayload) bool {
+	return pol != DefaultPassPolicy() && h.app.ReplayLRU().Seen("chal:"+p.Nonce)
 }
 
 // writeContinuePage serves the 200 "Continuing…" page that sends the browser
