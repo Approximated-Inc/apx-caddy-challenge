@@ -62,13 +62,26 @@ bad value fails the config load rather than silently changing the cookie.
 **Rolling renewal.** When `pass_max_ttl_seconds` > idle TTL, a request with a
 valid cookie that has less than half the idle TTL left gets a fresh cookie
 (same `Secure; HttpOnly; SameSite=Lax; Path=/`, `Max-Age` = new expiry) with
-expiry `min(now + idle, issued_at + max)`. The cookie then carries its original
-solve time (`i`); renewal never moves it, so an active visitor is re-challenged
-once per `pass_max_ttl_seconds` instead of once per idle TTL, and an idle one
-once the idle TTL lapses. Cookies minted without `i` (all cookies before this
-change, and any minted while rolling was off) are treated as issued at
-`exp - 600s`. Renewal adds a `Set-Cookie` to the proxied upstream response
-when it fires.
+expiry `min(now + idle, issued_at + max)`. Under rolling, the cookie carries
+`i`, the issue time of the challenge that was solved (not the verify time),
+and renewal never moves it. An active visitor is re-challenged once per
+`pass_max_ttl_seconds` instead of once per idle TTL, and an idle one once the
+idle TTL lapses. Verify also rejects a cookie once `i + pass_max_ttl_seconds`
+has passed, so lowering the cap takes effect at once rather than at each
+cookie's `exp`. Cookies without `i` (all cookies before this change, and any
+minted while rolling was off) are accepted until their own `exp` and never
+renewed, so their holders solve once more after rolling is turned on.
+Renewal adds a `Set-Cookie` to the proxied upstream response when it fires.
+
+**Challenge binding and single use.** Under any non-default policy, the
+challenge token is bound to the same prefix width and (under UA binding) the
+same UA hash as the cookie it earns, and a solved challenge is single-use per
+machine (the shared bounded nonce LRU also used by Edge Verify). One solve
+therefore mints one cookie, for the address and UA that fetched the page.
+Single use is per machine, not cluster-wide: the same solution posted to
+another machine within the token's 5-minute life can mint a second cookie, for
+the same prefix and UA. Under the default policy, tokens are byte-identical to
+before and verify stays reusable, as it always was.
 
 Security trade-offs:
 
@@ -97,6 +110,15 @@ Security trade-offs:
   browser update mid-session changes the UA and triggers one re-challenge.
   Turning it on invalidates outstanding cookies once (they carry no UA hash);
   turning it off accepts both kinds.
+
+**Rollout.** Caddy strict-unmarshals config at load and at machine boot, so
+an image without these keys rejects any config containing a `pass_*` key. The
+app must gate emitting them on an image capability. During a mixed deploy,
+machines on the old image ignore `u` (they accept a UA-bound cookie from any
+UA), ignore `i` (no cap enforcement), and reject /32 or other non-/24 cookies
+and challenge tokens (those users are re-challenged when a request lands on an
+old machine). Safe order: roll the image fleet-wide first, then turn the keys
+on per cluster.
 
 **TLS fingerprint binding is not offered.** JA3/JA4 are computed by the
 caddy-l4 fork's `tls` matcher and stored only as layer4 connection vars

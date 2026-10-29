@@ -500,7 +500,8 @@ func TestHandleVerifyIssuesPolicyCookie(t *testing.T) {
 	pol.IdleTTL = 900 * time.Second
 	pol.BindUserAgent = true
 	h := policyHandler(pol)
-	tokExp := time.Now().Add(challengeTokenTTL)
+	// Token issued 2 minutes before the solve is posted.
+	tokExp := time.Now().Add(challengeTokenTTL - 2*time.Minute)
 	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA-1", "/x", tokExp)
 
 	w := postVerify(t, h, tok, "203.0.113.5", "UA-1")
