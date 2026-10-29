@@ -13,6 +13,7 @@
 <h1>Checking your browser…</h1>
 <div class="spinner" aria-hidden="true"></div>
 <p class="muted" id="apx-intro">This automated check verifies you're not a bot. It runs once and takes a moment.</p>
+<p class="muted" id="apx-verifying" hidden>Verifying…</p>
 <div id="apx-slow" hidden>
 <p class="muted">Still checking… this can take a minute on slower devices.</p>
 <p><button type="button" class="button button-secondary" data-apx-retry>Retry</button></p>
@@ -68,9 +69,17 @@
   // Reasons a later progress report undoes: the solver turned out to be alive.
   var soft = { timeout: 1, stalled: 1, error: 1 };
 
+  function setRetryDisabled(off) {
+    var rs = document.querySelectorAll ? document.querySelectorAll("[data-apx-retry]") : [];
+    for (var i = 0; i < rs.length; i++) {
+      rs[i].disabled = off;
+      if (off) rs[i].setAttribute("disabled", "disabled"); else rs[i].removeAttribute("disabled");
+    }
+  }
   function fail(reason, panelId) {
     if (failReason !== null) return;
     failReason = String(reason || "error");
+    setRetryDisabled(false);
     failPanel = byId(panelId || "apx-failed");
     if (!failPanel) return;
     hide(byId("apx-checking"));
@@ -87,7 +96,19 @@
   }
 
   window.apxChallengeFail = function (reason) { fail(reason || "error"); };
-  window.apxChallengeDone = function () { done = true; };
+  // Solved: the form is being submitted. Replace any stall/timeout panel with
+  // a neutral "Verifying…" state and disable Retry for the round-trip.
+  window.apxChallengeDone = function () {
+    done = true;
+    if (failPanel) hide(failPanel);
+    failReason = null;
+    failPanel = null;
+    hide(byId("apx-intro"));
+    hide(byId("apx-slow"));
+    show(byId("apx-checking"));
+    show(byId("apx-verifying"));
+    setRetryDisabled(true);
+  };
   window.apxChallengeProgress = function () {
     lastProgress = now();
     progressSeen = true;
@@ -101,7 +122,10 @@
 
   var retries = document.querySelectorAll ? document.querySelectorAll("[data-apx-retry]") : [];
   for (var i = 0; i < retries.length; i++) {
-    retries[i].addEventListener("click", function () { location.reload(); });
+    retries[i].addEventListener("click", function () {
+      if (this.getAttribute("disabled") !== null) return;
+      location.reload();
+    });
   }
 
   // The pass cookie is Secure + SameSite=Lax; if a cookie with the same
@@ -114,7 +138,7 @@
       var probe = "apx-challenge-probe=1";
       document.cookie = probe + "; path=/; SameSite=Lax; Secure";
       var ok = document.cookie.indexOf(probe) !== -1;
-      document.cookie = "apx-challenge-probe=; path=/; SameSite=Lax; Secure; max-age=0";
+      document.cookie = "apx-challenge-probe=; path=/; SameSite=Lax; Secure; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT";
       return ok;
     } catch (e) {
       return false;

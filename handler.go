@@ -5,7 +5,6 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,17 +18,6 @@ const (
 	cookieTTL         = 10 * time.Minute
 	challengeTokenTTL = 5 * time.Minute
 	outcomeVarKey     = "apx_challenge_outcome"
-
-	// triesCookieName counts recent verifies ("<failed>.<passed>") so a check
-	// can't redirect-loop: at maxVerifyTries of either kind the visitor gets an
-	// explanation page instead of another challenge. Passes count too, because
-	// a browser that never stores or sends the pass cookie loops on success.
-	// The counter is cleared only when a request presents a valid pass cookie.
-	// Its lifetime covers several token TTLs plus slow solves, so a solve that
-	// takes longer than a few minutes still counts as the next attempt.
-	triesCookieName = "apx-challenge-tries"
-	triesCookieTTL  = 30 * time.Minute
-	maxVerifyTries  = 3
 )
 
 // ChallengeHandler serves the PoW challenge / verifies solutions. Invoked by the
@@ -120,10 +108,10 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		failed, passed := verifyTries(r)
-		failed++
-		setTriesCookie(w, failed, passed)
-		if failed >= maxVerifyTries {
+		st := readTries(r, h.app.Secret(), ip)
+		st.countFailure()
+		writeTries(w, h.app.Secret(), ip, st)
+		if st.Failed >= maxVerifyTries {
 			writeGaveUpPage(w, ret, false)
 			return nil
 		}
@@ -142,10 +130,10 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		MaxAge:   int(cookieTTL.Seconds()),
 	})
 	setOutcome(r, "passed")
-	failed, passed := verifyTries(r)
-	passed++
-	setTriesCookie(w, failed, passed)
-	if passed >= maxVerifyTries {
+	st := readTries(r, h.app.Secret(), ip)
+	st.countPass(time.Now())
+	writeTries(w, h.app.Secret(), ip, st)
+	if st.Passed >= maxVerifyTries {
 		// Passed repeatedly but never came back with the pass cookie.
 		writeGaveUpPage(w, safeReturn(p.Ret), true)
 		return nil
@@ -163,57 +151,6 @@ func writeGaveUpPage(w http.ResponseWriter, ret string, passedButNotKept bool) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(renderFailedPage(ret, passedButNotKept)))
-}
-
-func setTriesCookie(w http.ResponseWriter, failed, passed int) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     triesCookieName,
-		Value:    strconv.Itoa(failed) + "." + strconv.Itoa(passed),
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(triesCookieTTL.Seconds()),
-	})
-}
-
-// verifyTries reads the counter as (failed, passed). Missing or malformed
-// counts as zero; values are clamped so they can't overflow.
-func verifyTries(r *http.Request) (failed, passed int) {
-	c, err := r.Cookie(triesCookieName)
-	if err != nil {
-		return 0, 0
-	}
-	f, p, ok := strings.Cut(c.Value, ".")
-	if !ok {
-		return 0, 0
-	}
-	return clampTries(f), clampTries(p)
-}
-
-func clampTries(v string) int {
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		return 0
-	}
-	return min(n, maxVerifyTries)
-}
-
-// clearTriesCookie expires the counter once a request presents a valid pass
-// cookie. Only sent when the request carried one.
-func clearTriesCookie(w http.ResponseWriter, r *http.Request) {
-	if _, err := r.Cookie(triesCookieName); err != nil {
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     triesCookieName,
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
 }
 
 // isBrowserFormPost reports whether a verify POST came from a page navigation
