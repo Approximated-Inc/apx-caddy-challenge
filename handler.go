@@ -94,10 +94,12 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	ret := safeReturn(r.URL.RequestURI())
 	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now.Add(challengeTokenTTL))
 	var fb *fallbackView
-	if h.app.Fallback().Enabled {
-		ftok, nonce := issueFallbackToken(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now)
-		setFallbackCookie(w, h.app.Secret(), nonce)
-		fb = &fallbackView{Token: ftok, PixelURL: fallbackPixelURL(h.app.Secret(), h.app.VerifyPath(), nonce), VerifyPath: h.app.VerifyPath(), Ret: ret}
+	if h.app.Fallback().Enabled && isLikelyDocument(r) {
+		pol := h.app.PassPolicy()
+		ftok, nonce := issueFallbackToken(h.app.Secret(), pol, ip, r.UserAgent(), ret, now)
+		setFallbackCookie(w, h.app.Secret(), withNonce(readFallbackNonces(r, h.app.Secret()), nonce))
+		pixel := fallbackPixelURL(h.app.Secret(), h.app.VerifyPath(), pol, ip, r.UserAgent(), nonce, now.Add(fallbackTokenTTL).Unix())
+		fb = &fallbackView{Token: ftok, PixelURL: pixel, VerifyPath: h.app.VerifyPath(), Ret: ret}
 	}
 	body := renderChallengePage(tok, h.app.Difficulty(), h.app.VerifyPath(), r.URL.RequestURI(), defaultChallengeTimeoutMs, fb)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

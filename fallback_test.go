@@ -2,12 +2,14 @@ package apxchallenge
 
 import (
 	"bytes"
+	"encoding/json"
 	"image/gif"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,6 +72,12 @@ func fbPost(ip, ua, token, ret string, cookies ...*http.Cookie) *http.Request {
 	return withVars(r)
 }
 
+// fbCookie is a well-signed fallback cookie listing nonces.
+func fbCookie(secret string, nonces ...string) *http.Cookie {
+	body, _ := json.Marshal(nonces)
+	return &http.Cookie{Name: fallbackCookieName, Value: encodeSigned(secret, fallbackCookieDomain, body)}
+}
+
 func respCookie(w *httptest.ResponseRecorder, name string) *http.Cookie {
 	for _, c := range w.Result().Cookies() {
 		if c.Name == name {
@@ -114,6 +122,7 @@ func fetchPixel(t *testing.T, h *ChallengeHandler, pixel, ip string) *httptest.R
 	r.RemoteAddr = ip + ":443"
 	r.Header.Set("Accept", "image/avif,image/webp,*/*")
 	r.Header.Set("Sec-Fetch-Dest", "image")
+	r.Header.Set("User-Agent", fbUA)
 	r = withVars(r)
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, r, nextOK))
@@ -151,15 +160,43 @@ func requireFailed(t *testing.T, w *httptest.ResponseRecorder, r *http.Request, 
 	require.Equal(t, "failed", outcomeOf(r))
 }
 
-func TestFallbackDefaultPageMatchesGolden(t *testing.T) {
-	want, err := os.ReadFile("testdata/challenge_page_default.golden.html")
-	require.NoError(t, err)
-	require.Equal(t, string(want), renderPage("TOKEN.SIG", 16, "/__apx_challenge/verify", "/a?b=<c>&d=\"e\"", 0))
-	require.Equal(t, string(want), renderChallengePage("TOKEN.SIG", 16, "/__apx_challenge/verify", "/a?b=<c>&d=\"e\"", 0, nil))
+// goldenFallbackView is a fixed fallback for the enabled-page golden.
+var goldenFallbackView = fallbackView{
+	Token:      "FALLBACK.TOKEN",
+	PixelURL:   "/__apx_challenge/verify?apx_fallback_pixel=NONCE.1700000000.SIG",
+	VerifyPath: "/__apx_challenge/verify",
+	Ret:        "/a?b=<c>&d=\"e\"",
 }
 
-func TestFallbackUnchangedConfigIsOffAndByteIdentical(t *testing.T) {
+func TestFallbackGoldenPages(t *testing.T) {
+	// Fallback off: byte-identical to master's page before the fallback (240c45a).
+	off, err := os.ReadFile("testdata/challenge_page_fallback_disabled.golden.html")
+	require.NoError(t, err)
+	require.Equal(t, string(off), renderPage("TOKEN.SIG", 16, "/__apx_challenge/verify", "/a?b=<c>&d=\"e\"", 0))
+	require.Equal(t, string(off), renderChallengePage("TOKEN.SIG", 16, "/__apx_challenge/verify", "/a?b=<c>&d=\"e\"", 0, nil))
+
+	// Fallback on (the default): pinned so changes to it are deliberate.
+	on, err := os.ReadFile("testdata/challenge_page_fallback_enabled.golden.html")
+	require.NoError(t, err)
+	fb := goldenFallbackView
+	require.Equal(t, string(on), renderChallengePage("TOKEN.SIG", 16, "/__apx_challenge/verify", "/a?b=<c>&d=\"e\"", 0, &fb))
+}
+
+func TestFallbackIsOnByDefault(t *testing.T) {
 	app := &ChallengeApp{SecretCfg: "s"}
+	require.NoError(t, app.Provision(caddy.Context{}))
+	require.Equal(t, FallbackConfig{Enabled: true, PassTTL: 600 * time.Second, MaxPerHour: 3, MinDwell: 2 * time.Second}, app.Fallback())
+
+	h := &ChallengeHandler{app: app}
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, fbGet("/page?x=1", fbIP, fbUA), nextOK))
+	require.Contains(t, w.Body.String(), "apx-fallback-form")
+	require.Contains(t, w.Body.String(), fallbackPixelParam)
+	require.NotNil(t, respCookie(w, fallbackCookieName))
+}
+
+func TestFallbackOptOutIsByteIdentical(t *testing.T) {
+	app := &ChallengeApp{SecretCfg: "s", FallbackDisabledCfg: true}
 	require.NoError(t, app.Provision(caddy.Context{}))
 	require.False(t, app.Fallback().Enabled)
 
@@ -173,6 +210,14 @@ func TestFallbackUnchangedConfigIsOffAndByteIdentical(t *testing.T) {
 	require.NotContains(t, body, "apx-fallback-form")
 	require.NotContains(t, body, fallbackPixelParam)
 	require.Len(t, w.Result().Cookies(), 0)
+
+	// The opt-out also drops the pixel route and fallback mode.
+	pr := httptest.NewRequest("GET", fallbackPixelURL("s", defaultVerifyPath, app.PassPolicy(), fbIP, fbUA, "Zm9vYmFyYmF6cXV4", time.Now().Add(time.Minute).Unix()), nil)
+	pr.RemoteAddr = fbIP + ":443"
+	pr.Header.Set("User-Agent", fbUA)
+	pw := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(pw, withVars(pr), nextOK))
+	require.NotEqual(t, "image/gif", pw.Header().Get("Content-Type"))
 }
 
 func TestFallbackDisabledHasNoPixelRouteOrPass(t *testing.T) {
@@ -181,20 +226,21 @@ func TestFallbackDisabledHasNoPixelRouteOrPass(t *testing.T) {
 	off.Enabled = false
 	h, app := fbHandler(DefaultPassPolicy(), off)
 	nonce := "AAAAAAAAAAAAAAAA"
-	w := fetchPixel(t, h, fallbackPixelURL(fbSecret, fbVP, nonce), fbIP)
+	exp := time.Now().Add(fallbackTokenTTL)
+	w := fetchPixel(t, h, fallbackPixelURL(fbSecret, fbVP, app.pol, fbIP, "", nonce, exp.Unix()), fbIP)
 	require.NotEqual(t, "image/gif", w.Header().Get("Content-Type"))
-	require.False(t, app.state.Rendered.Contains(fallbackRenderedKeyPrefix+nonce))
+	require.False(t, app.state.Rendered.Has(nonce, time.Now()))
 
 	// A well-formed fallback POST is not a fallback when off: no pass.
-	app.state.Rendered.Seen(fallbackRenderedKeyPrefix + nonce)
+	app.state.Rendered.Add(nonce, exp, time.Now())
 	tok := issueFallbackTokenNonce(fbSecret, app.pol, fbIP, fbUA, "/x", time.Now().Add(-time.Minute), nonce)
 	// Sanity: the same POST passes when the switch is on.
 	on := enabledFallback()
-	hOn := &ChallengeHandler{app: fbApp{fakeApp: app.fakeApp, pol: app.pol, fb: on, replay: NewNonceLRU(16), state: app.state}}
-	ckOn := &http.Cookie{Name: fallbackCookieName, Value: encodeSigned(fbSecret, fallbackCookieDomain, []byte(nonce))}
+	hOn := &ChallengeHandler{app: fbApp{fakeApp: app.fakeApp, pol: app.pol, fb: on, replay: NewNonceLRU(16), state: renderedState(nonce)}}
+	ckOn := fbCookie(fbSecret, nonce)
 	require.NotNil(t, respCookie(postFallback(t, hOn, fbPost(fbIP, fbUA, tok, "/x", ckOn)), CookieName))
 
-	ck := &http.Cookie{Name: fallbackCookieName, Value: encodeSigned(fbSecret, fallbackCookieDomain, []byte(nonce))}
+	ck := fbCookie(fbSecret, nonce)
 	r := fbPost(fbIP, fbUA, tok, "/x", ck)
 	w = postFallback(t, h, r)
 	requireFailed(t, w, r, "/x")
@@ -305,7 +351,7 @@ func TestFallbackFailures(t *testing.T) {
 			p := issue(t, h, fbIP, fbUA, "/r")
 			fetchPixel(t, h, p.pixel, fbIP)
 			tp, _ := verifyFallbackToken(fbSecret, app.pol, p.token, fbIP, fbUA, time.Now())
-			forged := &http.Cookie{Name: fallbackCookieName, Value: encodeSigned("other-secret", fallbackCookieDomain, []byte(tp.Nonce))}
+			forged := fbCookie("other-secret", tp.Nonce)
 			return fbPost(fbIP, fbUA, backdate(t, app, p.token, fbIP, fbUA, 3*time.Second), "/r", forged)
 		}},
 		{"pixel not rendered", DefaultPassPolicy(), nil, func(t *testing.T, h *ChallengeHandler, app fbApp) *http.Request {
@@ -345,11 +391,18 @@ func TestFallbackFailures(t *testing.T) {
 			fetchPixel(t, h, p.pixel, fbIP)
 			return fbPost(fbIP, fbUA, backdate(t, app, p.token, fbIP, fbUA, fallbackTokenTTL+2*time.Second), "/r", p.cookie)
 		}},
-		{"challenge token in the fallback field", DefaultPassPolicy(), nil, func(t *testing.T, h *ChallengeHandler, app fbApp) *http.Request {
+		{"fallback payload signed under another label", DefaultPassPolicy(), nil, func(t *testing.T, h *ChallengeHandler, app fbApp) *http.Request {
+			// Cookie, render and dwell all hold; only the signature label is wrong.
 			p := issue(t, h, fbIP, fbUA, "/r")
 			fetchPixel(t, h, p.pixel, fbIP)
-			m := regexp.MustCompile(`name="challenge" value="([^"]+)"`).FindStringSubmatch(p.body)
-			return fbPost(fbIP, fbUA, m[1], "/r", p.cookie)
+			tp, err := verifyFallbackToken(fbSecret, app.pol, p.token, fbIP, fbUA, time.Now())
+			require.NoError(t, err)
+			tp.Iat = time.Now().Add(-3 * time.Second).UnixMilli()
+			body, _ := json.Marshal(tp)
+			good := encodeSigned(fbSecret, fallbackDomain, body)
+			ok := postFallback(t, &ChallengeHandler{app: fbApp{fakeApp: app.fakeApp, pol: app.pol, fb: app.fb, replay: app.replay, state: renderedState(tp.Nonce)}}, fbPost(fbIP, fbUA, good, "/r", p.cookie))
+			require.NotNil(t, respCookie(ok, CookieName), "control: the same body under the fallback label passes")
+			return fbPost(fbIP, fbUA, encodeSigned(fbSecret, challengeDomain, body), "/r", p.cookie)
 		}},
 		{"rate limit", DefaultPassPolicy(), func(fb *FallbackConfig) { fb.MaxPerHour = 2 }, func(t *testing.T, h *ChallengeHandler, app fbApp) *http.Request {
 			// Two passes from the /24 (different addresses in it), then the third fails.
@@ -378,6 +431,14 @@ func TestFallbackFailures(t *testing.T) {
 	}
 }
 
+// renderedState is a fresh state with nonce rendered, so a control POST
+// doesn't spend the nonce in the state under test.
+func renderedState(nonce string) *FallbackState {
+	st := NewFallbackState(16)
+	st.Rendered.Add(nonce, time.Now().Add(fallbackTokenTTL), time.Now())
+	return st
+}
+
 func TestFallbackNonBrowserPostGets403(t *testing.T) {
 	h, _ := fbHandler(DefaultPassPolicy(), enabledFallback())
 	p := issue(t, h, fbIP, fbUA, "/r")
@@ -402,11 +463,25 @@ func TestFallbackUnboundUAStillPasses(t *testing.T) {
 }
 
 func TestFallbackPixelEndpoint(t *testing.T) {
-	h, app := fbHandler(DefaultPassPolicy(), enabledFallback())
+	uaPol := DefaultPassPolicy()
+	uaPol.BindUserAgent = true
+	h, app := fbHandler(uaPol, enabledFallback())
 	nonce := "Zm9vYmFyYmF6cXV4"
-	good := fallbackPixelURL(fbSecret, fbVP, nonce)
+	now := time.Now()
+	exp := now.Add(fallbackTokenTTL).Unix()
+	good := fallbackPixelURL(fbSecret, fbVP, uaPol, fbIP, fbUA, nonce, exp)
 
-	w := fetchPixel(t, h, good, fbIP)
+	get := func(u, ip, ua, method string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, u, nil)
+		r.RemoteAddr = ip + ":443"
+		r.Header.Set("Accept", "image/avif,image/webp,*/*")
+		r.Header.Set("User-Agent", ua)
+		w := httptest.NewRecorder()
+		require.NoError(t, h.ServeHTTP(w, withVars(r), nextOK))
+		return w
+	}
+
+	w := get(good, "203.0.113.200", fbUA, "GET") // same /24
 	require.Equal(t, 200, w.Code)
 	require.Equal(t, "image/gif", w.Header().Get("Content-Type"))
 	require.Equal(t, "no-store", w.Header().Get("Cache-Control"))
@@ -414,35 +489,42 @@ func TestFallbackPixelEndpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, img.Bounds().Dx())
 	require.Equal(t, 1, img.Bounds().Dy())
-	require.True(t, app.state.Rendered.Contains(fallbackRenderedKeyPrefix+nonce))
+	require.True(t, app.state.Rendered.Has(nonce, now))
+	// The render record lives as long as the token, no longer.
+	require.False(t, app.state.Rendered.Has(nonce, time.Unix(exp+1, 0)))
 
-	bad := []string{
-		fbVP + "?" + fallbackPixelParam + "=" + nonce + ".AAAA",                                                   // bad signature
-		fallbackPixelURL("other-secret", fbVP, "b3RoZXJub25jZXh4"),                                                // other secret
-		fbVP + "?" + fallbackPixelParam + "=",                                                                     // empty
-		fbVP + "?" + fallbackPixelParam + "=" + "short." + sign(fbSecret, fallbackPixelDomain, []byte("short")),   // wrong nonce length
-		fbVP + "?" + fallbackPixelParam + "=" + nonce + "." + sign(fbSecret, fallbackCookieDomain, []byte(nonce)), // another domain's signature
+	param := fbVP + "?" + fallbackPixelParam + "="
+	e := strconv.FormatInt(exp, 10)
+	past := now.Add(-time.Second).Unix()
+	bad := []struct{ name, url, ip, ua string }{
+		{"bad signature", param + nonce + "." + e + ".AAAA", fbIP, fbUA},
+		{"other secret", fallbackPixelURL("other-secret", fbVP, uaPol, fbIP, fbUA, nonce, exp), fbIP, fbUA},
+		{"expired", fallbackPixelURL(fbSecret, fbVP, uaPol, fbIP, fbUA, nonce, past), fbIP, fbUA},
+		{"expiry edited", param + nonce + "." + strconv.FormatInt(exp+3600, 10) + "." + good[strings.LastIndexByte(good, '.')+1:], fbIP, fbUA},
+		{"other prefix", good, "198.51.100.7", fbUA},
+		{"other UA under UA binding", good, fbIP, "curl/8.0"},
+		{"empty", param, fbIP, fbUA},
+		{"nonce only", param + nonce + "." + sign(fbSecret, fallbackPixelDomain, []byte(nonce)), fbIP, fbUA},
+		{"wrong nonce length", fallbackPixelURL(fbSecret, fbVP, uaPol, fbIP, fbUA, "short", exp), fbIP, fbUA},
+		{"another domain's signature", param + nonce + "." + e + "." + sign(fbSecret, fallbackCookieDomain, []byte(nonce+"|"+e+"|203.0.113.0/24|"+uaHash(fbUA))), fbIP, fbUA},
 	}
-	for _, u := range bad {
+	for _, tc := range bad {
 		app.state = NewFallbackState(16)
 		h.app = app
-		w := fetchPixel(t, h, u, fbIP)
-		require.Equal(t, http.StatusNotFound, w.Code, u)
-		require.Equal(t, "no-store", w.Header().Get("Cache-Control"), u)
-		require.Empty(t, w.Body.String(), u)
-		require.Equal(t, 0, app.state.Rendered.ll.Len(), u)
+		w := get(tc.url, tc.ip, tc.ua, "GET")
+		require.Equal(t, http.StatusNotFound, w.Code, tc.name)
+		require.Equal(t, "no-store", w.Header().Get("Cache-Control"), tc.name)
+		require.Empty(t, w.Body.String(), tc.name)
+		require.Equal(t, 0, app.state.Rendered.ll.Len(), tc.name)
 	}
 
 	// HEAD records too but sends no body.
 	app.state = NewFallbackState(16)
 	h.app = app
-	r := httptest.NewRequest("HEAD", good, nil)
-	r.RemoteAddr = fbIP + ":443"
-	w = httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, withVars(r), nextOK))
+	w = get(good, fbIP, fbUA, "HEAD")
 	require.Equal(t, 200, w.Code)
 	require.Empty(t, w.Body.Bytes())
-	require.True(t, app.state.Rendered.Contains(fallbackRenderedKeyPrefix+nonce))
+	require.True(t, app.state.Rendered.Has(nonce, now))
 }
 
 func TestFallbackRenderEscapes(t *testing.T) {
@@ -464,11 +546,25 @@ func TestFallbackRenderEscapes(t *testing.T) {
 }
 
 func TestFallbackConfigValidation(t *testing.T) {
-	fb, err := buildFallbackConfig(false, 0, 0, 0)
+	fb, err := buildFallbackConfig(false, 0, 0, 0, 600*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, FallbackConfig{PassTTL: 600 * time.Second, MaxPerHour: 3, MinDwell: 2 * time.Second}, fb)
 
-	app := &ChallengeApp{SecretCfg: "s", FallbackEnabledCfg: true, FallbackPassTTLSecondsCfg: 120, FallbackMaxPerHourCfg: 5, FallbackMinDwellSecondsCfg: 4}
+	// Never longer than a solved cookie: the default clamps, an explicit value errors.
+	fb, err = buildFallbackConfig(true, 0, 0, 0, 300*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, 300*time.Second, fb.PassTTL)
+	_, err = buildFallbackConfig(true, 301, 0, 0, 300*time.Second)
+	require.ErrorContains(t, err, "must not exceed the pass idle TTL")
+	fb, err = buildFallbackConfig(true, 300, 0, 0, 300*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, 300*time.Second, fb.PassTTL)
+	clamped := &ChallengeApp{SecretCfg: "s", PassIdleTTLSecondsCfg: 120}
+	require.NoError(t, clamped.Provision(caddy.Context{}))
+	require.Equal(t, 120*time.Second, clamped.Fallback().PassTTL)
+	require.Error(t, (&ChallengeApp{SecretCfg: "s", PassIdleTTLSecondsCfg: 120, FallbackPassTTLSecondsCfg: 121}).Provision(caddy.Context{}))
+
+	app := &ChallengeApp{SecretCfg: "s", FallbackPassTTLSecondsCfg: 120, FallbackMaxPerHourCfg: 5, FallbackMinDwellSecondsCfg: 4}
 	require.NoError(t, app.Provision(caddy.Context{}))
 	require.Equal(t, FallbackConfig{Enabled: true, PassTTL: 120 * time.Second, MaxPerHour: 5, MinDwell: 4 * time.Second}, app.Fallback())
 	require.Same(t, processFallbackState, app.FallbackState())
@@ -486,7 +582,7 @@ func TestFallbackConfigValidation(t *testing.T) {
 	}
 	for _, ok := range []ChallengeApp{
 		{SecretCfg: "s", FallbackPassTTLSecondsCfg: 60, FallbackMaxPerHourCfg: 1, FallbackMinDwellSecondsCfg: 1},
-		{SecretCfg: "s", FallbackPassTTLSecondsCfg: 86400, FallbackMaxPerHourCfg: 1000, FallbackMinDwellSecondsCfg: 60},
+		{SecretCfg: "s", PassIdleTTLSecondsCfg: 86400, FallbackPassTTLSecondsCfg: 86400, FallbackMaxPerHourCfg: 1000, FallbackMinDwellSecondsCfg: 60},
 	} {
 		require.NoError(t, ok.Provision(caddy.Context{}))
 	}
@@ -509,10 +605,162 @@ func TestFallbackLimiter(t *testing.T) {
 	require.NotContains(t, l.m, "a")
 }
 
-func TestNonceLRUContainsDoesNotRecord(t *testing.T) {
-	l := NewNonceLRU(4)
-	require.False(t, l.Contains("x"))
-	require.False(t, l.Contains("x"))
-	require.False(t, l.Seen("x"))
-	require.True(t, l.Contains("x"))
+func TestFallbackNeverTouchesSharedReplayLRU(t *testing.T) {
+	fb := enabledFallback()
+	fb.MaxPerHour = 1
+	h, app := fbHandler(DefaultPassPolicy(), fb)
+	pass := func(ip string) (*httptest.ResponseRecorder, string) {
+		p := issue(t, h, ip, fbUA, "/r")
+		fetchPixel(t, h, p.pixel, ip)
+		tok := backdate(t, app, p.token, ip, fbUA, 3*time.Second)
+		tp, _ := verifyFallbackToken(fbSecret, app.pol, tok, ip, fbUA, time.Now())
+		return postFallback(t, h, fbPost(ip, fbUA, tok, "/r", p.cookie)), tp.Nonce
+	}
+	w, first := pass(fbIP)
+	require.NotNil(t, respCookie(w, CookieName))
+	require.True(t, app.state.Spent.Has(first, time.Now()))
+
+	// Over the budget: fails, and the nonce is not spent.
+	w, second := pass("203.0.113.6")
+	require.Nil(t, respCookie(w, CookieName))
+	require.False(t, app.state.Spent.Has(second, time.Now()), "a rate-denied attempt must not spend its nonce")
+
+	require.Equal(t, 0, app.replay.ll.Len(), "fallback must not write the shared replay LRU")
+}
+
+// faviconReq is an old browser's subresource request: Accept */*, no Sec-Fetch.
+func faviconReq(ip string, cookies ...*http.Cookie) *http.Request {
+	r := httptest.NewRequest("GET", "/favicon.ico", nil)
+	r.RemoteAddr = ip + ":443"
+	r.Header.Set("Accept", "*/*")
+	r.Header.Set("User-Agent", fbUA)
+	for _, c := range cookies {
+		r.AddCookie(c)
+	}
+	return withVars(r)
+}
+
+func TestFallbackFaviconAfterPageDoesNotStrandIt(t *testing.T) {
+	h, app := fbHandler(DefaultPassPolicy(), enabledFallback())
+	p := issue(t, h, fbIP, fbUA, "/r")
+
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, faviconReq(fbIP, p.cookie), nextOK))
+	require.Equal(t, 200, w.Code, "still a challenge page")
+	require.Nil(t, respCookie(w, fallbackCookieName), "a */* subresource must not touch the fallback cookie")
+	require.NotContains(t, w.Body.String(), "apx-fallback-form")
+
+	fetchPixel(t, h, p.pixel, fbIP)
+	w = postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, p.token, fbIP, fbUA, 3*time.Second), "/r", p.cookie))
+	require.NotNil(t, respCookie(w, CookieName))
+}
+
+func TestFallbackDocumentDetection(t *testing.T) {
+	for _, tc := range []struct {
+		accept, dest string
+		want         bool
+	}{
+		{"text/html,application/xhtml+xml", "", true},
+		{"text/html, application/xhtml+xml, image/jxr, */*", "", true}, // IE11 navigation
+		{"*/*", "document", true},
+		{"*/*", "", false},
+		{"image/avif,image/webp,*/*", "image", false},
+		{"", "", false},
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("Accept", tc.accept)
+		if tc.dest != "" {
+			r.Header.Set("Sec-Fetch-Dest", tc.dest)
+		}
+		require.Equal(t, tc.want, isLikelyDocument(r), "%+v", tc)
+	}
+}
+
+func TestFallbackTwoTabs(t *testing.T) {
+	h, app := fbHandler(DefaultPassPolicy(), enabledFallback())
+	a := issue(t, h, fbIP, fbUA, "/a")
+	// Tab B loads while the browser holds tab A's cookie.
+	rb := fbGet("/b", fbIP, fbUA)
+	rb.AddCookie(a.cookie)
+	wb := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(wb, rb, nextOK))
+	bTok := fbTokenRe.FindStringSubmatch(wb.Body.String())[1]
+	bPixel := fbPixelRe.FindStringSubmatch(wb.Body.String())[1]
+	jar := respCookie(wb, fallbackCookieName)
+	require.NotNil(t, jar)
+
+	fetchPixel(t, h, a.pixel, fbIP)
+	fetchPixel(t, h, bPixel, fbIP)
+
+	// Tab A continues with the latest cookie, then tab B.
+	wa := postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, a.token, fbIP, fbUA, 3*time.Second), "/a", jar))
+	require.NotNil(t, respCookie(wa, CookieName), "the older tab passes")
+	jar = respCookie(wa, fallbackCookieName)
+	require.NotNil(t, jar)
+	require.Greater(t, jar.MaxAge, 0, "the other tab's nonce is kept")
+	wb2 := postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, bTok, fbIP, fbUA, 3*time.Second), "/b", jar))
+	require.NotNil(t, respCookie(wb2, CookieName), "the newer tab passes")
+	require.Equal(t, -1, respCookie(wb2, fallbackCookieName).MaxAge, "cookie cleared once empty")
+}
+
+func TestFallbackCookieKeepsRecentNonces(t *testing.T) {
+	var ns []string
+	for _, n := range []string{"a", "b", "c", "d", "e", "c"} {
+		ns = withNonce(ns, n)
+	}
+	require.Equal(t, []string{"c", "e", "d", "b"}, ns)
+	require.Equal(t, []string{"c", "d", "b"}, withoutNonce(ns, "e"))
+
+	// A cookie listing more than the cap is read only up to the cap.
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(fbCookie(fbSecret, "1", "2", "3", "4", "5"))
+	require.Equal(t, []string{"1", "2", "3", "4"}, readFallbackNonces(r, fbSecret))
+	require.False(t, fallbackCookieMatches(r, fbSecret, "5"))
+	require.True(t, fallbackCookieMatches(r, fbSecret, "4"))
+}
+
+func TestExpiringSet(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	s := NewExpiringSet(3)
+	s.Add("a", now.Add(10*time.Second), now)
+	require.True(t, s.Has("a", now.Add(10*time.Second)))
+	require.False(t, s.Has("a", now.Add(11*time.Second)), "expired")
+	require.False(t, s.Has("x", now))
+
+	require.True(t, s.AddIfAbsent("b", now.Add(time.Minute), now))
+	require.False(t, s.AddIfAbsent("b", now.Add(time.Minute), now), "live record")
+	// An expired record can be re-added.
+	require.True(t, s.AddIfAbsent("a", now.Add(time.Minute), now.Add(20*time.Second)))
+
+	// Expired records are dropped from the old end on add.
+	s2 := NewExpiringSet(10)
+	s2.Add("old", now, now)
+	s2.Add("new", now.Add(time.Hour), now.Add(time.Minute))
+	require.Equal(t, 1, s2.ll.Len())
+
+	// Bounded: past max, the least recently added goes.
+	s3 := NewExpiringSet(2)
+	for _, k := range []string{"p", "q", "r"} {
+		s3.Add(k, now.Add(time.Hour), now)
+	}
+	require.Equal(t, 2, s3.ll.Len())
+	require.False(t, s3.Has("p", now))
+	require.True(t, s3.Has("r", now))
+}
+
+func TestFallbackReplayDoesNotUseBudget(t *testing.T) {
+	fb := enabledFallback()
+	fb.MaxPerHour = 2
+	h, app := fbHandler(DefaultPassPolicy(), fb)
+	p := issue(t, h, fbIP, fbUA, "/r")
+	fetchPixel(t, h, p.pixel, fbIP)
+	tok := backdate(t, app, p.token, fbIP, fbUA, 3*time.Second)
+	require.NotNil(t, respCookie(postFallback(t, h, fbPost(fbIP, fbUA, tok, "/r", p.cookie)), CookieName))
+	require.Nil(t, respCookie(postFallback(t, h, fbPost(fbIP, fbUA, tok, "/r", p.cookie)), CookieName), "replay fails")
+
+	// The replay used no budget, so a second real pass from the prefix fits.
+	q := issue(t, h, fbIP, fbUA, "/r")
+	fetchPixel(t, h, q.pixel, fbIP)
+	w := postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, q.token, fbIP, fbUA, 3*time.Second), "/r", q.cookie))
+	require.NotNil(t, respCookie(w, CookieName))
 }

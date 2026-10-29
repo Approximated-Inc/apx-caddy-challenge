@@ -84,12 +84,14 @@ type ChallengeApp struct {
 	PassIPv6PrefixCfg     int  `json:"pass_ipv6_prefix,omitempty"`
 	PassBindUserAgentCfg  bool `json:"pass_bind_user_agent,omitempty"`
 
-	// Render-check fallback (all optional; absent = off, page unchanged).
-	// fallback_enabled: offer the no-JavaScript fallback form.
+	// Render-check fallback (all optional; absent = on with the defaults, so
+	// rollout needs no new config key).
+	// fallback_disabled: emergency opt-out; the page is then byte-identical to
+	// the pre-fallback page.
 	// fallback_pass_ttl_seconds: non-rolling pass-cookie lifetime it earns.
 	// fallback_max_per_hour: fallback passes per client prefix per hour, per machine.
 	// fallback_min_dwell_seconds: minimum time from page issue to the POST.
-	FallbackEnabledCfg         bool `json:"fallback_enabled,omitempty"`
+	FallbackDisabledCfg        bool `json:"fallback_disabled,omitempty"`
 	FallbackPassTTLSecondsCfg  int  `json:"fallback_pass_ttl_seconds,omitempty"`
 	FallbackMaxPerHourCfg      int  `json:"fallback_max_per_hour,omitempty"`
 	FallbackMinDwellSecondsCfg int  `json:"fallback_min_dwell_seconds,omitempty"`
@@ -168,8 +170,8 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	}
 	a.passPolicy = pol
 
-	fb, err := buildFallbackConfig(a.FallbackEnabledCfg, a.FallbackPassTTLSecondsCfg,
-		a.FallbackMaxPerHourCfg, a.FallbackMinDwellSecondsCfg)
+	fb, err := buildFallbackConfig(!a.FallbackDisabledCfg, a.FallbackPassTTLSecondsCfg,
+		a.FallbackMaxPerHourCfg, a.FallbackMinDwellSecondsCfg, pol.IdleTTL)
 	if err != nil {
 		return err
 	}

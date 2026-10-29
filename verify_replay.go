@@ -41,11 +41,3 @@ func (l *NonceLRU) Seen(nonce string) bool {
 	}
 	return false
 }
-
-// Contains reports whether nonce is present, without recording it.
-func (l *NonceLRU) Contains(nonce string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	_, ok := l.m[nonce]
-	return ok
-}

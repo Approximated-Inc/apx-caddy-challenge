@@ -138,15 +138,20 @@ Binding would need the fingerprint carried across that hop (a custom PROXY v2
 TLV written by caddy-l4's proxy handler and read back by an HTTP listener
 wrapper into a request var or placeholder), plus an image rollout of both.
 
-### Render-check fallback (optional, off by default)
+### Render-check fallback (on by default)
 
 The challenge answers "is this a browser?", not "is this a human?". Some real
 browsers can't run the proof-of-work script (old TV browsers, locked-down
-setups, script-blocking extensions). With `fallback_enabled`, the page also
-offers a plain HTML form with a **Continue** button, shown in the `<noscript>`
+setups, script-blocking extensions). The page also offers a plain HTML form with a **Continue** button, shown in the `<noscript>`
 block and in the failure panel (after a stall, timeout or error). It needs no
 JavaScript, and it passes only when the visitor behaves like a browser that
 renders the page, which simple HTTP clients (curl, scripts, scrapers) don't.
+
+The form and the fallback cookie are added only to challenge responses that
+are likely to be displayed (`Accept` contains `text/html`, or
+`Sec-Fetch-Dest: document`). A challenged subresource such as `/favicon.ico`,
+which older browsers fetch with `Accept: */*` and no `Sec-Fetch-*` headers,
+gets the plain challenge page and leaves the fallback cookie alone.
 
 A fallback POST (`mode=fallback`, to `verify_path`) passes only when all hold:
 
@@ -154,41 +159,64 @@ A fallback POST (`mode=fallback`, to `verify_path`) passes only when all hold:
    `fallback` label, unexpired, 10-minute life), for the same client prefix
    and (under `pass_bind_user_agent`) the same UA as the pass-cookie policy.
 2. **Cookie round-trip.** The request carries `__Host-apx-challenge-fallback`
-   (Secure, HttpOnly, SameSite=Lax, Path=/, Max-Age 600), set by the challenge
-   response and signed over the token's nonce.
+   (Secure, HttpOnly, SameSite=Lax, Path=/, Max-Age 600). It holds a signed
+   list of the 4 most recent fallback nonces issued to this browser, so a
+   second tab doesn't strand the first; the token's nonce must be in it. A
+   pass removes that nonce and clears the cookie once the list is empty.
 3. **Render proof.** The page's inline `<style>` gives an element inside the
-   form a CSS `background-image` of a signed 1×1 GIF at
-   `verify_path?apx_fallback_pixel=<nonce>.<sig>`. Serving it (`Cache-Control:
-   no-store`; a bad signature is a 404) records the nonce as rendered in a
-   bounded per-process set. The POST needs the nonce recorded on this machine.
-   The pixel uses the verify path, so the existing verify route reaches it
-   (Caddy's `path` matcher ignores the query); no new route is needed.
+   form a CSS `background-image` of a 1×1 GIF at
+   `verify_path?apx_fallback_pixel=<nonce>.<exp>.<sig>`. The signature covers
+   the nonce, the token's expiry and the requester's client prefix (plus the
+   UA hash under `pass_bind_user_agent`), so a pixel URL works only until the
+   token expires and only from the network (and UA) that loaded the page.
+   Serving it (`Cache-Control: no-store`; anything invalid is a 404 and
+   records nothing) records the nonce as rendered on this machine until the
+   token's expiry. The pixel uses the verify path, so the existing verify
+   route reaches it (Caddy's `path` matcher ignores the query); no new route
+   is needed.
 4. **Dwell.** At least `fallback_min_dwell_seconds` since the token was issued.
-5. **Single use.** The nonce is spent on success (shared replay LRU).
-6. **Budget.** At most `fallback_max_per_hour` fallback passes per client
-   prefix (the pass policy's width) per hour, per machine.
+5. **Single use.** The nonce has not been spent by an earlier pass.
+6. **Budget.** Fewer than `fallback_max_per_hour` fallback passes from the
+   client prefix (the pass policy's width) in the last hour, on this machine.
+
+Nothing is recorded until every other condition holds; then the pass is
+counted against the budget and the nonce spent. A failed or rate-denied
+attempt spends nothing.
 
 A pass sets the normal `apx-challenge` cookie, but non-rolling (no issued-at,
 so it is never renewed) and with `fallback_pass_ttl_seconds` as its lifetime,
-clears the fallback cookie, sets the outcome `passed_fallback` and continues
-like a solve (tries counting, 303 to the original URL). Any failure takes the
-same path as a failed solve: a 403 for scripts, and for a browser form post a
-counted failure plus a redirect to a fresh challenge (the explanation page at
-the threshold).
+sets the outcome `passed_fallback` and continues like a solve (tries counting,
+303 to the original URL). Any failure takes the same path as a failed solve:
+a 403 for scripts, and for a browser form post a counted failure plus a
+redirect to a fresh challenge (the explanation page at the threshold).
 
 | Key | Default | Allowed | Effect |
 |-----|---------|---------|--------|
-| `fallback_enabled` | `false` | bool | Offer the fallback. Off: no markup, cookie, pixel or `mode=fallback` handling; the page is byte-identical to before. |
-| `fallback_pass_ttl_seconds` | `600` | 60–86400 | Lifetime of the non-rolling pass cookie a fallback pass earns. |
+| `fallback_disabled` | `false` | bool | Emergency opt-out. When true: no markup, cookie, pixel or `mode=fallback` handling, and the page is byte-identical to the page before the fallback existed. |
+| `fallback_pass_ttl_seconds` | `600`, clamped to the pass idle TTL | 60 to the pass idle TTL | Lifetime of the non-rolling pass cookie a fallback pass earns. Never longer than a solved cookie's idle TTL: a larger explicit value fails provisioning, and the default is lowered to the idle TTL when that is shorter. |
 | `fallback_max_per_hour` | `3` | 1–1000 | Fallback passes per client prefix per hour, per machine. |
 | `fallback_min_dwell_seconds` | `2` | 1–60 | Minimum time from page issue to the POST. |
 
-**Per machine.** Rendered nonces, spent nonces and the hourly budget are kept
-per process (they survive config reloads) and never shared. When the pixel and
-the POST land on different machines, the POST finds nothing recorded and fails
-safely into a fresh challenge; the visitor tries again. A browser usually
-sends both over one connection, so this is rare. The budget is per machine, so
-a cluster allows up to `fallback_max_per_hour` × machines per prefix.
+**Per machine, and separate.** Rendered nonces, spent nonces and the hourly
+budget live in the fallback's own per-process stores (they survive config
+reloads). They are never shared across machines, and never written to the
+replay set that Edge Verify and solved challenges use, so fallback traffic
+cannot evict those. When the pixel and the POST land on different machines,
+the POST finds nothing recorded and fails safely into a fresh challenge; the
+visitor tries again. A browser usually sends both over one connection, so
+this is rare. The budget is per machine, so a cluster allows up to
+`fallback_max_per_hour` × machines per prefix.
+
+**Store bounds.** Each store holds at most 65,536 entries and drops a record
+once its token has expired, so it only has to hold the live 10-minute window.
+Past the cap the oldest record is evicted. Every rendered record needs a
+fresh challenge page and a pixel fetch from the attacker's own prefix, so to
+evict a real visitor's render record an attacker has to load about 65,536
+challenge pages and pixels within 10 minutes (about 110 a second, sustained,
+on that one machine). The visitor then fails once into a fresh challenge and
+can try again. Spent records exist only for passes, which the hourly budget
+limits per prefix, so evicting a spent record (to replay a nonce within its
+token's life) needs that many passes from many prefixes.
 
 **What it does not stop.** A client that keeps cookies, parses the page's CSS,
 fetches the pixel and waits two seconds passes. The fallback raises the bar to
@@ -196,14 +224,18 @@ fetches the pixel and waits two seconds passes. The fallback raises the bar to
 one network gets that way, and the shorter, non-rolling cookie limits what
 each is worth. Text browsers that ignore CSS (lynx, w3m) fail it.
 
-**CSP.** The pixel is an image load, so it needs `img-src` to allow the site.
-Per-IP ledger routes serve the page with no CSP, so it works there. Edge
-sequence challenge routes get the app's response-guard CSP, which today is
-`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';
-form-action 'self'; base-uri 'none'; frame-ancestors 'none'`. With no
-`img-src`, `default-src 'none'` blocks the pixel, so the fallback always fails
-(safely, into a fresh challenge) on those routes until the app adds
-`img-src 'self'`:
+**CSP.** The pixel is an image load, so `img-src` must allow the site. Whenever
+a cluster has an edge-sequence challenge or a reputation mode of `block` or
+`challenge`, the app emits its response-guard route ahead of every challenge
+route (it has no matcher). That route sets this CSP on every issued challenge
+page, including per-IP ledger and reputation challenges:
+
+    default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'
+
+With no `img-src`, `default-src 'none'` blocks the pixel, so the fallback
+always fails there (safely, into a fresh challenge). Only clusters without the
+guard (ledger challenges and nothing else) serve the page with no CSP, so the
+fallback works there as it is. The app needs to add `img-src 'self'`:
 
     default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'
 
@@ -211,10 +243,21 @@ No CSP-compatible alternative exists under `default-src 'none'`: every
 subresource fetch (images, fonts, frames, stylesheets, prefetch) falls back to
 it, and only the form navigation is allowed.
 
-**Rollout.** Same as the `pass_*` keys: an older image rejects a config with a
-`fallback_*` key (strict unmarshal), so the app must gate them on an image
-capability, and should ship the CSP change above before enabling the fallback
-on edge-sequence challenges.
+The fallback needs no config: every machine running this image serves it
+with the defaults above. All `fallback_*` keys are optional.
+
+**Rollout.** Deploy the image; every machine then serves the fallback, and the
+app emits no new key. Before the image rolls out, the app must:
+
+- accept the `passed_fallback` outcome at analytics ingest (Approximated
+  PR #442), or those passes are dropped from analytics;
+- add `img-src 'self'` to the response-guard CSP (also #442), or the pixel is
+  blocked on every cluster that emits the guard and the fallback fails there
+  (safely, into a fresh challenge).
+
+The optional keys (`fallback_disabled` and the tuning keys) are rejected by an
+older image (Caddy strict-unmarshals config), so the app should emit them only
+when it needs them, gated on an image capability like the `pass_*` keys.
 
 ## Build (xcaddy — image step)
 

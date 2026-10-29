@@ -50,9 +50,8 @@ const (
 	maxFallbackMinDwellSeconds     = 60
 
 	fallbackNonceEncodedLen = 16 // base64url of the 12-byte nonce
-	// Key prefixes keep rendered and spent nonces apart from other entries.
-	fallbackRenderedKeyPrefix = "fbr:"
-	fallbackSpentKeyPrefix    = "fb:"
+	// fallbackCookieNonces is how many recent nonces the fallback cookie keeps.
+	fallbackCookieNonces = 4
 )
 
 // FallbackConfig is the render-check fallback configuration (fallback_* keys).
@@ -65,17 +64,21 @@ type FallbackConfig struct {
 }
 
 // buildFallbackConfig validates the fallback_* keys. Zero values take the
-// defaults; out-of-range values fail provisioning.
-func buildFallbackConfig(enabled bool, passTTLS, maxPerHour, minDwellS int) (FallbackConfig, error) {
+// defaults; out-of-range values fail provisioning. The fallback cookie is never
+// longer-lived than a solved one: an explicit fallback_pass_ttl_seconds above
+// passIdleTTL is an error, and the default is clamped to passIdleTTL.
+func buildFallbackConfig(enabled bool, passTTLS, maxPerHour, minDwellS int, passIdleTTL time.Duration) (FallbackConfig, error) {
 	fb := FallbackConfig{
 		Enabled:    enabled,
-		PassTTL:    defaultFallbackPassTTLSeconds * time.Second,
+		PassTTL:    min(defaultFallbackPassTTLSeconds*time.Second, passIdleTTL),
 		MaxPerHour: defaultFallbackMaxPerHour,
 		MinDwell:   defaultFallbackMinDwellSeconds * time.Second,
 	}
 	switch {
 	case passTTLS < 0, passTTLS > 0 && (passTTLS < minFallbackPassTTLSeconds || passTTLS > maxFallbackPassTTLSeconds):
 		return fb, fmt.Errorf("apx_challenge app: fallback_pass_ttl_seconds must be %d-%d (got %d)", minFallbackPassTTLSeconds, maxFallbackPassTTLSeconds, passTTLS)
+	case passTTLS > 0 && time.Duration(passTTLS)*time.Second > passIdleTTL:
+		return fb, fmt.Errorf("apx_challenge app: fallback_pass_ttl_seconds (%d) must not exceed the pass idle TTL (%d)", passTTLS, int(passIdleTTL.Seconds()))
 	case passTTLS > 0:
 		fb.PassTTL = time.Duration(passTTLS) * time.Second
 	}
@@ -95,15 +98,18 @@ func buildFallbackConfig(enabled bool, passTTLS, maxPerHour, minDwellS int) (Fal
 }
 
 // FallbackState is the per-machine memory the fallback needs: nonces whose
-// pixel was fetched here, and recent fallback passes per client prefix.
+// pixel was fetched here, nonces spent by a pass, and recent fallback passes
+// per client prefix. It is separate from the replay LRU Edge Verify and the
+// solve path share, so fallback traffic can never evict their entries.
 type FallbackState struct {
-	Rendered *NonceLRU
+	Rendered *ExpiringSet
+	Spent    *ExpiringSet
 	Limiter  *FallbackLimiter
 }
 
 // NewFallbackState returns empty stores bounded to size entries each.
 func NewFallbackState(size int) *FallbackState {
-	return &FallbackState{Rendered: NewNonceLRU(size), Limiter: NewFallbackLimiter(size)}
+	return &FallbackState{Rendered: NewExpiringSet(size), Spent: NewExpiringSet(size), Limiter: NewFallbackLimiter(size)}
 }
 
 // processFallbackState lives at package level for the same reason as
@@ -170,11 +176,18 @@ func verifyFallbackToken(secret string, pol PassPolicy, token, ip, ua string, no
 	return p, nil
 }
 
-// setFallbackCookie sets the cookie a fallback POST must carry back.
-func setFallbackCookie(w http.ResponseWriter, secret, nonce string) {
+// setFallbackCookie sets the cookie a fallback POST must carry back. It holds
+// the most recent fallbackCookieNonces nonces, newest first, so a second tab
+// or a stray challenged subresource doesn't strand the page being read.
+func setFallbackCookie(w http.ResponseWriter, secret string, nonces []string) {
+	if len(nonces) == 0 {
+		clearFallbackCookie(w)
+		return
+	}
+	body, _ := json.Marshal(nonces)
 	http.SetCookie(w, &http.Cookie{
 		Name:     fallbackCookieName,
-		Value:    encodeSigned(secret, fallbackCookieDomain, []byte(nonce)),
+		Value:    encodeSigned(secret, fallbackCookieDomain, body),
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,
@@ -195,37 +208,106 @@ func clearFallbackCookie(w http.ResponseWriter) {
 	})
 }
 
-// fallbackCookieMatches reports whether r carries a well-signed fallback
-// cookie for nonce.
-func fallbackCookieMatches(r *http.Request, secret, nonce string) bool {
+// readFallbackNonces returns the nonces in r's fallback cookie, or nil when
+// it is missing, unsigned or forged.
+func readFallbackNonces(r *http.Request, secret string) []string {
 	c, err := r.Cookie(fallbackCookieName)
 	if err != nil {
-		return false
+		return nil
 	}
 	body, err := splitVerify(secret, fallbackCookieDomain, c.Value)
 	if err != nil {
-		return false
+		return nil
 	}
-	return hmac.Equal(body, []byte(nonce))
+	var ns []string
+	if json.Unmarshal(body, &ns) != nil {
+		return nil
+	}
+	if len(ns) > fallbackCookieNonces {
+		ns = ns[:fallbackCookieNonces]
+	}
+	return ns
+}
+
+// withNonce returns ns with nonce first, deduplicated, at most
+// fallbackCookieNonces long.
+func withNonce(ns []string, nonce string) []string {
+	out := []string{nonce}
+	for _, n := range ns {
+		if n != nonce && len(out) < fallbackCookieNonces {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// withoutNonce returns ns without nonce.
+func withoutNonce(ns []string, nonce string) []string {
+	out := make([]string, 0, len(ns))
+	for _, n := range ns {
+		if n != nonce {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// fallbackCookieMatches reports whether r carries a well-signed fallback
+// cookie listing nonce.
+func fallbackCookieMatches(r *http.Request, secret, nonce string) bool {
+	for _, n := range readFallbackNonces(r, secret) {
+		if hmac.Equal([]byte(n), []byte(nonce)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isLikelyDocument reports whether a challenged request is probably a page
+// the visitor will see, not a subresource such as /favicon.ico (old browsers
+// send those with Accept: */* and no Sec-Fetch headers). Only those get the
+// fallback form and a fallback cookie update.
+func isLikelyDocument(r *http.Request) bool {
+	return r.Header.Get("Sec-Fetch-Dest") == "document" || strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
 // fallbackPixelURL is the signed image URL the page's CSS loads. It sits on
-// the verify path (as a query) so the existing verify route reaches it.
-func fallbackPixelURL(secret, verifyPath, nonce string) string {
-	return verifyPath + "?" + fallbackPixelParam + "=" + nonce + "." + sign(secret, fallbackPixelDomain, []byte(nonce))
+// the verify path (as a query) so the existing verify route reaches it. The
+// signature covers the nonce, the token's expiry and the requester's prefix
+// (and UA hash under UA binding), so an archived URL dies with its token and
+// works only from the network that fetched the page.
+func fallbackPixelURL(secret, verifyPath string, pol PassPolicy, ip, ua, nonce string, exp int64) string {
+	e := strconv.FormatInt(exp, 10)
+	return verifyPath + "?" + fallbackPixelParam + "=" + nonce + "." + e + "." + fallbackPixelSig(secret, pol, ip, ua, nonce, e)
 }
 
-// verifyFallbackPixel returns the nonce of a well-signed pixel value.
-func verifyFallbackPixel(secret, v string) (string, bool) {
-	dot := strings.IndexByte(v, '.')
-	if dot != fallbackNonceEncodedLen {
-		return "", false
+func fallbackPixelSig(secret string, pol PassPolicy, ip, ua, nonce, exp string) string {
+	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
+	uah := ""
+	if pol.BindUserAgent {
+		uah = uaHash(ua)
 	}
-	nonce := v[:dot]
-	if !hmac.Equal([]byte(v[dot+1:]), []byte(sign(secret, fallbackPixelDomain, []byte(nonce)))) {
-		return "", false
+	return sign(secret, fallbackPixelDomain, []byte(nonce+"|"+exp+"|"+pref+"|"+uah))
+}
+
+// verifyFallbackPixel returns the nonce and expiry of a pixel value signed
+// for this requester and not yet expired.
+func verifyFallbackPixel(secret string, pol PassPolicy, ip, ua, v string, now time.Time) (string, time.Time, bool) {
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 || len(parts[0]) != fallbackNonceEncodedLen {
+		return "", time.Time{}, false
 	}
-	return nonce, true
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || now.Unix() > exp {
+		return "", time.Time{}, false
+	}
+	if _, ok := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix); !ok {
+		return "", time.Time{}, false
+	}
+	if !hmac.Equal([]byte(parts[2]), []byte(fallbackPixelSig(secret, pol, ip, ua, parts[0], parts[1]))) {
+		return "", time.Time{}, false
+	}
+	return parts[0], time.Unix(exp, 0), true
 }
 
 // transparentGIF is a 1x1 transparent GIF.
@@ -243,12 +325,13 @@ func isFallbackPixelRequest(r *http.Request, verifyPath string) bool {
 // and returns the image. Anything else is a 404 and records nothing.
 func (h *ChallengeHandler) serveFallbackPixel(w http.ResponseWriter, r *http.Request) error {
 	w.Header().Set("Cache-Control", "no-store")
-	nonce, ok := verifyFallbackPixel(h.app.Secret(), r.URL.Query().Get(fallbackPixelParam))
+	now := time.Now()
+	nonce, exp, ok := verifyFallbackPixel(h.app.Secret(), h.app.PassPolicy(), clientIP(r), r.UserAgent(), r.URL.Query().Get(fallbackPixelParam), now)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return nil
 	}
-	h.app.FallbackState().Rendered.Seen(fallbackRenderedKeyPrefix + nonce)
+	h.app.FallbackState().Rendered.Add(nonce, exp, now)
 	w.Header().Set("Content-Type", "image/gif")
 	w.Header().Set("Content-Length", strconv.Itoa(len(transparentGIF)))
 	w.WriteHeader(http.StatusOK)
@@ -259,21 +342,26 @@ func (h *ChallengeHandler) serveFallbackPixel(w http.ResponseWriter, r *http.Req
 }
 
 // fallbackFailure names the first pass condition a fallback POST misses, or
-// "" when it passes. The nonce is spent and the pass counted against the
-// prefix's budget only once every other condition holds.
+// "" when it passes. Nothing is recorded until every other condition holds:
+// then the pass is counted against the prefix's budget and the nonce spent.
+// Two concurrent posts of one nonce can both use a budget slot; only one
+// passes.
 func (h *ChallengeHandler) fallbackFailure(r *http.Request, p fallbackPayload, now time.Time) string {
 	fb, st := h.app.Fallback(), h.app.FallbackState()
+	exp := time.Unix(p.Exp, 0)
 	switch {
 	case !fallbackCookieMatches(r, h.app.Secret(), p.Nonce):
 		return "cookie"
-	case !st.Rendered.Contains(fallbackRenderedKeyPrefix + p.Nonce):
+	case !st.Rendered.Has(p.Nonce, now):
 		return "not_rendered"
 	case now.Sub(time.UnixMilli(p.Iat)) < fb.MinDwell:
 		return "too_fast"
-	case h.app.ReplayLRU().Seen(fallbackSpentKeyPrefix + p.Nonce):
+	case st.Spent.Has(p.Nonce, now):
 		return "replayed"
 	case !st.Limiter.Allow(p.Prefix, fb.MaxPerHour, now):
 		return "rate_limited"
+	case !st.Spent.AddIfAbsent(p.Nonce, exp, now):
+		return "replayed"
 	}
 	return ""
 }
@@ -295,7 +383,7 @@ func (h *ChallengeHandler) handleFallbackVerify(w http.ResponseWriter, r *http.R
 	fpol.IdleTTL, fpol.MaxTTL = h.app.Fallback().PassTTL, h.app.Fallback().PassTTL
 	exp := fpol.InitialExp(now, now)
 	setPassCookie(w, IssuePassCookie(h.app.Secret(), fpol, ip, r.UserAgent(), time.Time{}, exp), exp, now)
-	clearFallbackCookie(w)
+	setFallbackCookie(w, h.app.Secret(), withoutNonce(readFallbackNonces(r, h.app.Secret()), p.Nonce))
 	setOutcome(r, "passed_fallback")
 	return h.verifyPassed(w, r, safeReturn(p.Ret))
 }
@@ -425,4 +513,75 @@ func (l *FallbackLimiter) Allow(key string, n int, now time.Time) bool {
 	}
 	e.times = append(e.times, now.UnixNano())
 	return true
+}
+
+// ExpiringSet is a bounded, concurrency-safe set of keys that each expire.
+// Expired keys count as absent; past max entries the least recently added
+// is evicted.
+type ExpiringSet struct {
+	mu  sync.Mutex
+	max int
+	ll  *list.List // front = most recently added
+	m   map[string]*list.Element
+}
+
+type expiringEntry struct {
+	key string
+	exp int64 // unix seconds; the key is live while now <= exp
+}
+
+func NewExpiringSet(max int) *ExpiringSet {
+	if max <= 0 {
+		max = 1
+	}
+	return &ExpiringSet{max: max, ll: list.New(), m: make(map[string]*list.Element)}
+}
+
+// Add records key until exp, replacing any earlier record.
+func (s *ExpiringSet) Add(key string, exp, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.add(key, exp, now)
+}
+
+// AddIfAbsent records key until exp and reports true, unless a live record
+// already exists (then it reports false and changes nothing).
+func (s *ExpiringSet) AddIfAbsent(key string, exp, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live(key, now) {
+		return false
+	}
+	s.add(key, exp, now)
+	return true
+}
+
+// Has reports whether key has a live record.
+func (s *ExpiringSet) Has(key string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.live(key, now)
+}
+
+func (s *ExpiringSet) live(key string, now time.Time) bool {
+	el, ok := s.m[key]
+	return ok && now.Unix() <= el.Value.(*expiringEntry).exp
+}
+
+func (s *ExpiringSet) add(key string, exp, now time.Time) {
+	if el, ok := s.m[key]; ok {
+		s.ll.Remove(el)
+		delete(s.m, key)
+	}
+	s.m[key] = s.ll.PushFront(&expiringEntry{key: key, exp: exp.Unix()})
+	// Drop expired records from the old end, then evict down to max.
+	for back := s.ll.Back(); back != nil && back.Value.(*expiringEntry).exp < now.Unix(); back = s.ll.Back() {
+		s.ll.Remove(back)
+		delete(s.m, back.Value.(*expiringEntry).key)
+	}
+	for s.ll.Len() > s.max {
+		back := s.ll.Back()
+		s.ll.Remove(back)
+		delete(s.m, back.Value.(*expiringEntry).key)
+	}
 }
