@@ -81,7 +81,10 @@ process level so a config reload does not forget spent solves). The token also
 carries its issue time (`i`), which becomes the cookie's issued-at; tokens
 without it (default policy, or minted by an older machine) fall back to
 `exp - 5 min`. One solve therefore mints one cookie, for the address and UA
-that fetched the page.
+that fetched the page. A replayed solve fails like any other verify: a bare
+403 for scripts, and for a browser form post a counted failure in the tries
+cookie plus a redirect to a fresh challenge (the explanation page at the
+threshold). A solve is recorded as spent only after its token and PoW verify.
 Single use is per machine, not cluster-wide: the same solution posted to
 another machine within the token's 5-minute life can mint a second cookie, for
 the same prefix and UA. Under the default policy, tokens are byte-identical to
