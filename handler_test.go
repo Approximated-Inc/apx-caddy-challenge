@@ -29,6 +29,7 @@ func (f fakeApp) VerifyTokenTTL() time.Duration { return 600 * time.Second }
 func (f fakeApp) VerifyScoring() string         { return "lenient" }
 func (f fakeApp) VerifyBodyCap() int64          { return 1048576 }
 func (f fakeApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }
+func (f fakeApp) PassPolicy() PassPolicy        { return DefaultPassPolicy() }
 
 func newHandler() *ChallengeHandler {
 	return &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 8, vp: "/__apx_challenge/verify"}}

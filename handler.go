@@ -58,10 +58,16 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		return h.handleVerify(w, r, ip)
 	}
 
-	if c, err := r.Cookie(CookieName); err == nil && VerifyCookie(h.app.Secret(), c.Value, ip) {
-		setOutcome(r, "passed_recently")
-		// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
-		return next.ServeHTTP(w, r)
+	if c, err := r.Cookie(CookieName); err == nil {
+		pol, now := h.app.PassPolicy(), time.Now()
+		if pc, ok := VerifyPassCookie(h.app.Secret(), pol, c.Value, ip, r.UserAgent(), now); ok {
+			if exp, renew := pol.Renewal(pc, now); renew {
+				setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp), exp, now)
+			}
+			setOutcome(r, "passed_recently")
+			// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
+			return next.ServeHTTP(w, r)
+		}
 	}
 
 	if isWebSocketOrSSE(r) {
@@ -99,15 +105,9 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     CookieName,
-		Value:    IssueCookie(h.app.Secret(), ip, time.Now().Add(cookieTTL)),
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(cookieTTL.Seconds()),
-	})
+	pol, now := h.app.PassPolicy(), time.Now()
+	exp := now.Add(pol.IdleTTL)
+	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), now, exp), exp, now)
 	setOutcome(r, "passed")
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)
