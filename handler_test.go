@@ -264,10 +264,10 @@ func TestBrowserVerifyCounterIncrementsThenExplains(t *testing.T) {
 	require.Equal(t, "3", triesCookie(t, w).Value)
 
 	// A malformed or huge counter can't wrap around into more redirects.
-	for _, v := range []string{"999999999999999999999", "7"} {
+	for _, v := range []string{"999999999999999999999", "9223372036854775807"} {
 		w = httptest.NewRecorder()
 		require.NoError(t, h.ServeHTTP(w, verifyPost(expiredForm("/dashboard"), true, &http.Cookie{Name: triesCookieName, Value: v}), nextOK))
-		if v == "7" {
+		if v == "9223372036854775807" { // MaxInt64 + 1 must not wrap negative
 			require.Equal(t, 200, w.Code)
 		} else {
 			require.Equal(t, 303, w.Code) // unparseable resets to 0
