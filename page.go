@@ -19,8 +19,11 @@ var pageCSS string
 //go:embed assets/verify_widget.js
 var verifyWidgetJS string
 
-// defaultChallengeTimeoutMs is how long the page waits for the solver before
-// it swaps the spinner for the "didn't finish" panel with a Retry button.
+// defaultChallengeTimeoutMs is how long the page shows the plain spinner.
+// After it the page says "Still checking…" while the solver keeps reporting
+// progress, and shows the failure panel only once progress stops. Because
+// failure is decided by stalled progress, not elapsed time, this value need
+// not scale with difficulty: it is only when a visitor starts to wonder.
 const defaultChallengeTimeoutMs = 20000
 
 // renderPage inlines the CSS + JS and injects the per-request challenge token,
@@ -42,9 +45,9 @@ func renderPage(challengeToken string, difficulty int, verifyPath, ret string, t
 	).Replace(pageHTML)
 }
 
-// failedPageHTML is served (200) when a browser has failed verification
-// maxVerifyTries times in a row, instead of redirecting to yet another
-// challenge. Same stylesheet as the challenge page.
+// failedPageHTML is served (200) instead of another challenge once a browser
+// has failed, or passed without keeping the pass cookie, maxVerifyTries times
+// in a row. Same stylesheet as the challenge page.
 const failedPageHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -54,10 +57,9 @@ const failedPageHTML = `<!doctype html>
 <style>{{CSS}}</style>
 </head>
 <body>
-<main class="box" id="apx-gave-up">
+<main class="box" id="apx-gave-up" data-reason="{{REASON}}">
 <h1>We couldn't confirm your browser</h1>
-<p>This site checks browsers before letting them in. Your browser tried the check several times in the last few minutes and it didn't pass.</p>
-<p class="muted">This can happen when your network address changes during the check (for example on a VPN or mobile data), when the page was left open for a long time, or when an extension blocks scripts.</p>
+{{BODY}}
 <p class="muted">You can try again now or in a few minutes. If it keeps happening, contact the owner of this site.</p>
 <p><a class="button" href="{{RET}}">Try again</a></p>
 </main>
@@ -65,12 +67,24 @@ const failedPageHTML = `<!doctype html>
 </html>
 `
 
-// renderFailedPage renders the "gave up after repeated failures" page with a
-// Retry link to the (sanitized) original path.
-func renderFailedPage(ret string) string {
+const failedBody = `<p>This site checks browsers before letting them in. Your browser tried the check several times in the last few minutes and it didn't pass.</p>
+<p class="muted">This can happen when your network address changes during the check (for example on a VPN or mobile data), when the page was left open for a long time, or when an extension blocks scripts.</p>`
+
+const notKeptBody = `<p>This site checks browsers before letting them in. Your browser passed the check several times, but the site couldn't see that on the next page, so it kept asking.</p>
+<p class="muted">This happens when cookies are blocked for this site, when the site is shown inside another site, or when your network address keeps changing (for example on a VPN or mobile data). Allowing cookies for this site or opening it directly usually fixes it.</p>`
+
+// renderFailedPage renders the loop-ending explanation page with a Retry link
+// to the (sanitized) original path.
+func renderFailedPage(ret string, passedButNotKept bool) string {
+	reason, body := "failed", failedBody
+	if passedButNotKept {
+		reason, body = "not_kept", notKeptBody
+	}
 	return strings.NewReplacer(
 		"{{CSS}}", pageCSS,
 		"{{RET}}", html.EscapeString(safeReturn(ret)),
+		"{{REASON}}", reason,
+		"{{BODY}}", body,
 	).Replace(failedPageHTML)
 }
 

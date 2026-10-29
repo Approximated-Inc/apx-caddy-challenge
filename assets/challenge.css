@@ -31,3 +31,4 @@ p { margin: 0 0 .75rem; }
 .button { display: inline-block; min-height: 44px; box-sizing: border-box; padding: .6rem 1.25rem; margin-top: .5rem; border: 1px solid var(--button); border-radius: 6px; background: var(--button); color: var(--button-ink); font: inherit; font-size: 1rem; font-weight: 500; text-decoration: none; cursor: pointer; }
 .button:hover { opacity: .9; }
 .button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.button-secondary { background: transparent; color: var(--ink); border-color: var(--line); }
