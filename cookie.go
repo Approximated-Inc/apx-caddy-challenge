@@ -28,6 +28,8 @@ type ChallengePayload struct {
 	Nonce  string `json:"n"`
 	Prefix string `json:"p"`
 	Ret    string `json:"r"`
+	// UA is the User-Agent hash, present only under pass_bind_user_agent.
+	UA string `json:"u,omitempty"`
 }
 
 // cookiePayload is the signed pass-cookie body. Iat and UA are omitted unless
@@ -39,10 +41,6 @@ type cookiePayload struct {
 	Iat    int64  `json:"i,omitempty"`
 	UA     string `json:"u,omitempty"`
 }
-
-// legacyPassTTL is the fixed lifetime of cookies minted without an issued-at,
-// used to infer their issue time (exp - 600s) for the absolute cap.
-const legacyPassTTL = 600 * time.Second
 
 // PassPolicy controls pass-cookie lifetime and binding. DefaultPassPolicy is
 // the original behaviour.
@@ -65,24 +63,35 @@ func DefaultPassPolicy() PassPolicy {
 // Rolling reports whether valid cookies are renewed while in use.
 func (pol PassPolicy) Rolling() bool { return pol.MaxTTL > pol.IdleTTL }
 
-// PassCookie is a verified pass cookie's lifetime.
+// PassCookie is a verified pass cookie's lifetime. IssuedAt is zero when the
+// cookie carries no issued-at (minted while rolling was off); such a cookie is
+// never renewed.
 type PassCookie struct {
 	Exp      time.Time
 	IssuedAt time.Time
 }
 
+// InitialExp is the expiry of a cookie minted at now for a challenge issued at
+// issuedAt: now + idle, clamped to issuedAt + max when rolling.
+func (pol PassPolicy) InitialExp(issuedAt, now time.Time) time.Time {
+	exp := now.Add(pol.IdleTTL)
+	if pol.Rolling() {
+		if capAt := issuedAt.Add(pol.MaxTTL); capAt.Before(exp) {
+			exp = capAt
+		}
+	}
+	return time.Unix(exp.Unix(), 0)
+}
+
 // Renewal returns the new expiry for a valid cookie when rolling renewal is on
 // and less than half the idle TTL remains: min(now + idle, issued_at + max).
-// False when renewal is off, not yet due, or the absolute cap is reached.
+// False when renewal is off, not yet due, the cookie has no issued-at, or the
+// absolute cap is reached.
 func (pol PassPolicy) Renewal(c PassCookie, now time.Time) (time.Time, bool) {
-	if !pol.Rolling() || c.Exp.Sub(now) >= pol.IdleTTL/2 {
+	if !pol.Rolling() || c.IssuedAt.IsZero() || c.Exp.Sub(now) >= pol.IdleTTL/2 {
 		return time.Time{}, false
 	}
-	exp := now.Add(pol.IdleTTL)
-	if capAt := c.IssuedAt.Add(pol.MaxTTL); capAt.Before(exp) {
-		exp = capAt
-	}
-	exp = time.Unix(exp.Unix(), 0)
+	exp := pol.InitialExp(c.IssuedAt, now)
 	if !exp.After(c.Exp) {
 		return time.Time{}, false
 	}
@@ -154,22 +163,40 @@ func splitVerify(secret, domain, token string) ([]byte, error) {
 	return body, nil
 }
 
-// IssueChallenge mints a signed PoW challenge token bound to the client prefix.
+// IssueChallenge mints a default-policy PoW challenge token bound to the
+// client /24 or /64.
 func IssueChallenge(secret, ip, ret string, exp time.Time) string {
+	return IssuePassChallenge(secret, DefaultPassPolicy(), ip, "", ret, exp)
+}
+
+// VerifyChallenge checks signature, expiry, and /24-or-/64 prefix match.
+func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
+	return VerifyPassChallenge(secret, DefaultPassPolicy(), token, ip, "", time.Now())
+}
+
+// IssuePassChallenge mints a PoW challenge token bound to the same prefix
+// width (and, under UA binding, the same UA hash) as the pass cookie it can
+// earn. Under the default policy the token is byte-compatible with the
+// pre-policy format.
+func IssuePassChallenge(secret string, pol PassPolicy, ip, ua, ret string, exp time.Time) string {
 	nb := make([]byte, 12)
 	_, _ = rand.Read(nb)
-	pref, _ := clientPrefix(ip)
-	body, _ := json.Marshal(ChallengePayload{
-		Exp:    exp.Unix(),
-		Nonce:  base64.RawURLEncoding.EncodeToString(nb),
-		Prefix: pref,
-		Ret:    ret,
-	})
+	return issueChallengeNonce(secret, pol, ip, ua, ret, exp, base64.RawURLEncoding.EncodeToString(nb))
+}
+
+func issueChallengeNonce(secret string, pol PassPolicy, ip, ua, ret string, exp time.Time, nonce string) string {
+	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
+	p := ChallengePayload{Exp: exp.Unix(), Nonce: nonce, Prefix: pref, Ret: ret}
+	if pol.BindUserAgent {
+		p.UA = uaHash(ua)
+	}
+	body, _ := json.Marshal(p)
 	return encodeSigned(secret, challengeDomain, body)
 }
 
-// VerifyChallenge checks signature, expiry, and prefix match.
-func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
+// VerifyPassChallenge checks signature, expiry, the prefix under pol and, when
+// pol binds the User-Agent, the UA hash.
+func VerifyPassChallenge(secret string, pol PassPolicy, token, ip, ua string, now time.Time) (ChallengePayload, error) {
 	body, err := splitVerify(secret, challengeDomain, token)
 	if err != nil {
 		return ChallengePayload{}, err
@@ -178,11 +205,14 @@ func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		return ChallengePayload{}, errInvalid
 	}
-	if time.Now().Unix() > p.Exp {
+	if now.Unix() > p.Exp {
 		return ChallengePayload{}, errInvalid
 	}
-	pref, ok := clientPrefix(ip)
+	pref, ok := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	if !ok || p.Prefix != pref {
+		return ChallengePayload{}, errInvalid
+	}
+	if pol.BindUserAgent && !hmac.Equal([]byte(p.UA), []byte(uaHash(ua))) {
 		return ChallengePayload{}, errInvalid
 	}
 	return p, nil
@@ -200,8 +230,9 @@ func VerifyCookie(secret, cookie, ip string) bool {
 	return ok
 }
 
-// IssuePassCookie mints a pass cookie under pol. issuedAt is recorded only
-// when pol is rolling, and the UA hash only when pol binds the User-Agent.
+// IssuePassCookie mints a pass cookie under pol. issuedAt (the solved
+// challenge's issue time) is recorded only when pol is rolling, and the UA
+// hash only when pol binds the User-Agent.
 func IssuePassCookie(secret string, pol PassPolicy, ip, ua string, issuedAt, exp time.Time) string {
 	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	p := cookiePayload{Exp: exp.Unix(), Prefix: pref}
@@ -216,8 +247,10 @@ func IssuePassCookie(secret string, pol PassPolicy, ip, ua string, issuedAt, exp
 }
 
 // VerifyPassCookie checks signature, expiry, prefix binding under pol and,
-// when pol binds the User-Agent, the UA hash. A cookie without an issued-at is
-// treated as issued at exp - 600s.
+// when pol binds the User-Agent, the UA hash. Under a rolling policy a cookie
+// with an issued-at is also rejected once issued-at + the current max TTL has
+// passed, so lowering the cap takes effect at once. A cookie without an
+// issued-at is accepted until its own exp and never renewed.
 func VerifyPassCookie(secret string, pol PassPolicy, cookie, ip, ua string, now time.Time) (PassCookie, bool) {
 	body, err := splitVerify(secret, cookieDomain, cookie)
 	if err != nil {
@@ -237,12 +270,14 @@ func VerifyPassCookie(secret string, pol PassPolicy, cookie, ip, ua string, now 
 	if pol.BindUserAgent && !hmac.Equal([]byte(p.UA), []byte(uaHash(ua))) {
 		return PassCookie{}, false
 	}
-	exp := time.Unix(p.Exp, 0)
-	iat := exp.Add(-legacyPassTTL)
+	pc := PassCookie{Exp: time.Unix(p.Exp, 0)}
 	if p.Iat != 0 {
-		iat = time.Unix(p.Iat, 0)
+		if pol.Rolling() && now.Unix() > p.Iat+int64(pol.MaxTTL/time.Second) {
+			return PassCookie{}, false
+		}
+		pc.IssuedAt = time.Unix(p.Iat, 0)
 	}
-	return PassCookie{Exp: exp, IssuedAt: iat}, true
+	return pc, true
 }
 
 // setPassCookie writes the pass cookie with Max-Age matching exp.

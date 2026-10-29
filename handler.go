@@ -85,7 +85,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	setOutcome(r, "issued")
-	tok := IssueChallenge(h.app.Secret(), ip, safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
+	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
 	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath())
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
@@ -99,15 +99,25 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	challenge := r.FormValue("challenge")
 	solution := r.FormValue("solution")
 
-	p, err := VerifyChallenge(h.app.Secret(), challenge, ip)
+	p, err := VerifyPassChallenge(h.app.Secret(), h.app.PassPolicy(), challenge, ip, r.UserAgent(), time.Now())
 	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) {
 		setOutcome(r, "failed")
 		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
 	pol, now := h.app.PassPolicy(), time.Now()
-	exp := now.Add(pol.IdleTTL)
-	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), now, exp), exp, now)
+	// Under a non-default policy a solved challenge is single-use per machine,
+	// so one solve can't mint a cookie per address or UA. Default stays as before.
+	if pol != DefaultPassPolicy() && h.app.ReplayLRU().Seen("chal:"+p.Nonce) {
+		setOutcome(r, "failed")
+		w.WriteHeader(http.StatusForbidden)
+		return nil
+	}
+	// The cap counts from the challenge's issue (tokens are minted with
+	// exp = issue + challengeTokenTTL), so replaying a token can't reset it.
+	iat := time.Unix(p.Exp, 0).Add(-challengeTokenTTL)
+	exp := pol.InitialExp(iat, now)
+	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), iat, exp), exp, now)
 	setOutcome(r, "passed")
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)

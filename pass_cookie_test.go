@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -52,15 +53,58 @@ func decodePayload(t *testing.T, cookie string) map[string]any {
 	return m
 }
 
-func TestDefaultPolicyCookieGolden(t *testing.T) {
-	exp := time.Unix(1893456000, 0) // 2030-01-01
-	got := IssuePassCookie("golden-secret", DefaultPassPolicy(), "203.0.113.5", "Mozilla/5.0", time.Unix(1893455400, 0), exp)
-	require.Equal(t, legacyIssueCookie("golden-secret", "203.0.113.5", exp), got)
-	require.Equal(t, "eyJlIjoxODkzNDU2MDAwLCJwIjoiMjAzLjAuMTEzLjAvMjQifQ."+sign("golden-secret", cookieDomain, []byte(`{"e":1893456000,"p":"203.0.113.0/24"}`)), got)
-	require.Equal(t, legacyIssueCookie("golden-secret", "203.0.113.5", exp), IssueCookie("golden-secret", "203.0.113.5", exp))
+// Literals produced by master 15fc6a5's own cookie.go (IssueCookie, and the
+// json.Marshal + encodeSigned body of IssueChallenge with a fixed nonce) for
+// secret "golden-secret", exp 1893456000 (2030-01-01). They pin the payload
+// shape AND the HMAC construction, so a change to either breaks them.
+const (
+	masterCookieV4    = "eyJlIjoxODkzNDU2MDAwLCJwIjoiMjAzLjAuMTEzLjAvMjQifQ.LrM1c0hxWRmj-1Rq72vpDeI7hhp-hqhmP3PJ4cMoQ38"
+	masterCookieV6    = "eyJlIjoxODkzNDU2MDAwLCJwIjoiMjAwMTpkYjg6MToyOjovNjQifQ.daepoAQmzg7JqfR9E-DnbJXmSowFPwCoDBWQaCxgJf4"
+	masterChallengeV4 = "eyJlIjoxODkzNDU2MDAwLCJuIjoiQUFBQUFBQUFBQUFBQUFBQSIsInAiOiIyMDMuMC4xMTMuMC8yNCIsInIiOiIvZGFzaD94PTEifQ.rDsSONjtY7d_xNynCFAolyA7ngPE2urtOu6t-WlcoDA"
+	goldenSecret      = "golden-secret"
+	goldenExpUnix     = 1893456000
+)
 
-	v6 := IssuePassCookie("golden-secret", DefaultPassPolicy(), "2001:db8:1:2:3:4:5:6", "", time.Time{}, exp)
-	require.Equal(t, legacyIssueCookie("golden-secret", "2001:db8:1:2:3:4:5:6", exp), v6)
+func TestDefaultPolicyCookieGolden(t *testing.T) {
+	exp := time.Unix(goldenExpUnix, 0)
+
+	// New code issues exactly master's bytes.
+	require.Equal(t, masterCookieV4, IssuePassCookie(goldenSecret, DefaultPassPolicy(), "203.0.113.5", "Mozilla/5.0", time.Unix(goldenExpUnix-600, 0), exp))
+	require.Equal(t, masterCookieV4, IssueCookie(goldenSecret, "203.0.113.5", exp))
+	require.Equal(t, masterCookieV6, IssuePassCookie(goldenSecret, DefaultPassPolicy(), "2001:db8:1:2:3:4:5:6", "", time.Time{}, exp))
+
+	// Master's bytes verify under the new code (valid until 2030).
+	now := time.Now()
+	pc, ok := VerifyPassCookie(goldenSecret, DefaultPassPolicy(), masterCookieV4, "203.0.113.250", "any", now)
+	require.True(t, ok)
+	require.Equal(t, int64(goldenExpUnix), pc.Exp.Unix())
+	require.True(t, VerifyCookie(goldenSecret, masterCookieV4, "203.0.113.1"))
+	require.True(t, VerifyCookie(goldenSecret, masterCookieV6, "2001:db8:1:2::99"))
+	require.False(t, VerifyCookie(goldenSecret, masterCookieV4, "203.0.114.1"))
+}
+
+func TestDefaultPolicyChallengeGolden(t *testing.T) {
+	exp := time.Unix(goldenExpUnix, 0)
+	require.Equal(t, masterChallengeV4, issueChallengeNonce(goldenSecret, DefaultPassPolicy(), "203.0.113.5", "Mozilla/5.0", "/dash?x=1", exp, "AAAAAAAAAAAAAAAA"))
+
+	p, err := VerifyChallenge(goldenSecret, masterChallengeV4, "203.0.113.9")
+	require.NoError(t, err)
+	require.Equal(t, "/dash?x=1", p.Ret)
+	require.Equal(t, "AAAAAAAAAAAAAAAA", p.Nonce)
+	_, err = VerifyPassChallenge(goldenSecret, DefaultPassPolicy(), masterChallengeV4, "203.0.113.9", "any", time.Now())
+	require.NoError(t, err)
+
+	// A default token issued by the new code has exactly master's keys.
+	tok := IssuePassChallenge(goldenSecret, DefaultPassPolicy(), "203.0.113.5", "UA", "/x", exp)
+	require.ElementsMatch(t, []string{"e", "n", "p", "r"}, keys(decodePayload(t, tok)))
+}
+
+func keys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func TestDefaultPolicyCrossVerifiesWithLegacy(t *testing.T) {
@@ -77,7 +121,7 @@ func TestDefaultPolicyCrossVerifiesWithLegacy(t *testing.T) {
 	pc, ok := VerifyPassCookie(secret, DefaultPassPolicy(), old, "203.0.113.77", "anything", now)
 	require.True(t, ok)
 	require.Equal(t, exp.Unix(), pc.Exp.Unix())
-	require.Equal(t, exp.Unix()-600, pc.IssuedAt.Unix(), "legacy cookie is treated as issued at exp - 600s")
+	require.True(t, pc.IssuedAt.IsZero(), "a cookie without an issued-at reports none")
 	require.True(t, VerifyCookie(secret, old, "203.0.113.77"))
 	_, ok = VerifyPassCookie(secret, DefaultPassPolicy(), old, "198.51.100.5", "", now)
 	require.False(t, ok)
@@ -164,17 +208,57 @@ func TestRollingCookieCarriesIssuedAtAcrossRenewal(t *testing.T) {
 	require.Equal(t, now.Add(pol.IdleTTL).Unix(), pc2.Exp.Unix())
 }
 
-func TestLegacyCookieUnderRollingPolicyUsesInferredIssuedAt(t *testing.T) {
+func TestCookieWithoutIssuedAtIsNeverRenewed(t *testing.T) {
 	pol := DefaultPassPolicy()
-	pol.MaxTTL = 900 * time.Second
+	pol.IdleTTL = 86400 * time.Second
+	pol.MaxTTL = 604800 * time.Second
 	now := time.Unix(1_000_000, 0)
-	old := legacyIssueCookie(secret, "203.0.113.5", now.Add(100*time.Second)) // inferred iat = now - 500s
-
+	// A cookie minted while rolling was off: accepted until its own exp...
+	old := IssuePassCookie(secret, DefaultPassPolicy(), "203.0.113.5", "", time.Time{}, now.Add(100*time.Second))
 	pc, ok := VerifyPassCookie(secret, pol, old, "203.0.113.5", "", now)
 	require.True(t, ok)
-	exp, renew := pol.Renewal(pc, now)
-	require.True(t, renew)
-	require.Equal(t, now.Add(400*time.Second).Unix(), exp.Unix(), "capped at inferred iat + 900s")
+	// ...but never extended, whatever its age.
+	_, renew := pol.Renewal(pc, now)
+	require.False(t, renew)
+	_, ok = VerifyPassCookie(secret, pol, old, "203.0.113.5", "", now.Add(101*time.Second))
+	require.False(t, ok)
+}
+
+func TestVerifyEnforcesCurrentAbsoluteCap(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	issued := rollingPolicy() // idle 600s, max 4h
+	iat := now.Add(-2 * time.Hour)
+	c := IssuePassCookie(secret, issued, "203.0.113.5", "", iat, now.Add(300*time.Second))
+
+	_, ok := VerifyPassCookie(secret, issued, c, "203.0.113.5", "", now)
+	require.True(t, ok)
+
+	// Operator lowers the cap to 1h: the 2h-old cookie is rejected before its exp.
+	lowered := DefaultPassPolicy()
+	lowered.MaxTTL = time.Hour
+	_, ok = VerifyPassCookie(secret, lowered, c, "203.0.113.5", "", now)
+	require.False(t, ok)
+
+	// Exactly at the cap still passes; one second past does not.
+	lowered.MaxTTL = 2 * time.Hour
+	_, ok = VerifyPassCookie(secret, lowered, c, "203.0.113.5", "", now)
+	require.True(t, ok)
+	_, ok = VerifyPassCookie(secret, lowered, c, "203.0.113.5", "", now.Add(time.Second))
+	require.False(t, ok)
+
+	// With rolling off the cap check does not apply; the cookie lives to exp.
+	_, ok = VerifyPassCookie(secret, DefaultPassPolicy(), c, "203.0.113.5", "", now)
+	require.True(t, ok)
+}
+
+func TestInitialExp(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	require.Equal(t, now.Add(600*time.Second), DefaultPassPolicy().InitialExp(now.Add(-time.Hour), now), "non-rolling ignores issued-at")
+
+	pol := DefaultPassPolicy()
+	pol.MaxTTL = 700 * time.Second
+	require.Equal(t, now.Add(600*time.Second), pol.InitialExp(now, now))
+	require.Equal(t, now.Add(400*time.Second), pol.InitialExp(now.Add(-300*time.Second), now), "clamped to issued_at + max")
 }
 
 func TestPrefixWidths(t *testing.T) {
@@ -309,13 +393,16 @@ func TestPassPolicyProvisionValidation(t *testing.T) {
 // policyApp is fakeApp with a configurable pass policy.
 type policyApp struct {
 	fakeApp
-	pol PassPolicy
+	pol    PassPolicy
+	replay *NonceLRU
 }
+
+func (p policyApp) ReplayLRU() *NonceLRU { return p.replay }
 
 func (p policyApp) PassPolicy() PassPolicy { return p.pol }
 
 func policyHandler(pol PassPolicy) *ChallengeHandler {
-	return &ChallengeHandler{app: policyApp{fakeApp: fakeApp{sec: "h-secret", diff: 8, vp: "/__apx_challenge/verify"}, pol: pol}}
+	return &ChallengeHandler{app: policyApp{fakeApp: fakeApp{sec: "h-secret", diff: 8, vp: "/__apx_challenge/verify"}, pol: pol, replay: NewNonceLRU(1024)}}
 }
 
 func passCookieHeader(t *testing.T, w *httptest.ResponseRecorder) *http.Cookie {
@@ -413,20 +500,15 @@ func TestHandleVerifyIssuesPolicyCookie(t *testing.T) {
 	pol.IdleTTL = 900 * time.Second
 	pol.BindUserAgent = true
 	h := policyHandler(pol)
-	tok := IssueChallenge("h-secret", "203.0.113.5", "/x", time.Now().Add(time.Minute))
-	sol := SolvePoW(tok, 8)
+	tokExp := time.Now().Add(challengeTokenTTL)
+	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA-1", "/x", tokExp)
 
-	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader("challenge="+tok+"&solution="+sol))
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.Header.Set("User-Agent", "UA-1")
-	r.RemoteAddr = "203.0.113.5:443"
-	r = withVars(r)
-	w := httptest.NewRecorder()
-	require.NoError(t, h.ServeHTTP(w, r, nextOK))
+	w := postVerify(t, h, tok, "203.0.113.5", "UA-1")
 	require.Equal(t, http.StatusSeeOther, w.Code)
 	c := passCookieHeader(t, w)
 	require.NotNil(t, c)
-	require.Equal(t, 900, c.MaxAge)
+	require.InDelta(t, 900, c.MaxAge, 1)
+	require.Equal(t, float64(tokExp.Unix()-int64(challengeTokenTTL/time.Second)), decodePayload(t, c.Value)["i"], "issued-at is the challenge's issue time")
 	require.True(t, c.HttpOnly)
 	require.True(t, c.Secure)
 	require.Equal(t, http.SameSiteLaxMode, c.SameSite)
@@ -436,6 +518,79 @@ func TestHandleVerifyIssuesPolicyCookie(t *testing.T) {
 	require.Contains(t, p, "u")
 	_, ok := VerifyPassCookie("h-secret", pol, c.Value, "203.0.113.5", "UA-1", time.Now())
 	require.True(t, ok)
+}
+
+func postVerify(t *testing.T, h *ChallengeHandler, tok, ip, ua string) *httptest.ResponseRecorder {
+	t.Helper()
+	form := url.Values{"challenge": {tok}, "solution": {SolvePoW(tok, 8)}}
+	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("User-Agent", ua)
+	r.RemoteAddr = ip + ":443"
+	r = withVars(r)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextOK))
+	return w
+}
+
+func TestChallengeTokenBindsPolicyPrefixAndUA(t *testing.T) {
+	pol := DefaultPassPolicy()
+	pol.IPv4Prefix = 32
+	pol.BindUserAgent = true
+	now := time.Now()
+	tok := IssuePassChallenge(secret, pol, "203.0.113.5", "UA-1", "/x", now.Add(time.Minute))
+	require.Equal(t, "203.0.113.5/32", decodePayload(t, tok)["p"])
+
+	_, err := VerifyPassChallenge(secret, pol, tok, "203.0.113.5", "UA-1", now)
+	require.NoError(t, err)
+	_, err = VerifyPassChallenge(secret, pol, tok, "203.0.113.6", "UA-1", now)
+	require.Error(t, err, "another address in the /24 can't use a /32 token")
+	_, err = VerifyPassChallenge(secret, pol, tok, "203.0.113.5", "UA-2", now)
+	require.Error(t, err, "another UA can't use a UA-bound token")
+
+	// A default (/24, no UA) token is rejected under the tighter policy.
+	_, err = VerifyPassChallenge(secret, pol, IssueChallenge(secret, "203.0.113.5", "/x", now.Add(time.Minute)), "203.0.113.5", "UA-1", now)
+	require.Error(t, err)
+}
+
+func TestOneSolveMintsOneCookieUnderPolicy(t *testing.T) {
+	pol := DefaultPassPolicy()
+	pol.IPv4Prefix = 32
+	pol.BindUserAgent = true
+	h := policyHandler(pol)
+	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA-1", "/x", time.Now().Add(challengeTokenTTL))
+
+	require.Equal(t, http.StatusSeeOther, postVerify(t, h, tok, "203.0.113.5", "UA-1").Code)
+	for _, c := range []struct{ ip, ua string }{
+		{"203.0.113.5", "UA-1"}, // straight replay
+		{"203.0.113.6", "UA-1"}, // other address
+		{"203.0.113.5", "UA-2"}, // other UA
+	} {
+		w := postVerify(t, h, tok, c.ip, c.ua)
+		require.Equal(t, http.StatusForbidden, w.Code, "%+v", c)
+		require.Nil(t, passCookieHeader(t, w), "%+v", c)
+	}
+}
+
+func TestRollingSolveIsSingleUse(t *testing.T) {
+	// Rolling only (/24, no UA): binding alone would let a second address in the
+	// /24 replay the solve and reset the cap; single-use stops it.
+	h := policyHandler(rollingPolicy())
+	tok := IssueChallenge("h-secret", "203.0.113.5", "/x", time.Now().Add(challengeTokenTTL))
+	require.Equal(t, http.StatusSeeOther, postVerify(t, h, tok, "203.0.113.5", "UA").Code)
+	w := postVerify(t, h, tok, "203.0.113.6", "UA")
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Nil(t, passCookieHeader(t, w))
+}
+
+func TestDefaultPolicyVerifyStaysReusable(t *testing.T) {
+	h := policyHandler(DefaultPassPolicy())
+	tok := IssueChallenge("h-secret", "203.0.113.5", "/x", time.Now().Add(challengeTokenTTL))
+	for i := 0; i < 2; i++ {
+		w := postVerify(t, h, tok, "203.0.113.5", "UA")
+		require.Equal(t, http.StatusSeeOther, w.Code, "default behaviour is unchanged: no single-use")
+		require.NotNil(t, passCookieHeader(t, w))
+	}
 }
 
 func TestHandleVerifyDefaultCookieShape(t *testing.T) {
