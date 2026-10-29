@@ -76,8 +76,12 @@ Renewal adds a `Set-Cookie` to the proxied upstream response when it fires.
 **Challenge binding and single use.** Under any non-default policy, the
 challenge token is bound to the same prefix width and (under UA binding) the
 same UA hash as the cookie it earns, and a solved challenge is single-use per
-machine (the shared bounded nonce LRU also used by Edge Verify). One solve
-therefore mints one cookie, for the address and UA that fetched the page.
+machine (the shared bounded nonce LRU also used by Edge Verify, kept at
+process level so a config reload does not forget spent solves). The token also
+carries its issue time (`i`), which becomes the cookie's issued-at; tokens
+without it (default policy, or minted by an older machine) fall back to
+`exp - 5 min`. One solve therefore mints one cookie, for the address and UA
+that fetched the page.
 Single use is per machine, not cluster-wide: the same solution posted to
 another machine within the token's 5-minute life can mint a second cookie, for
 the same prefix and UA. Under the default policy, tokens are byte-identical to
