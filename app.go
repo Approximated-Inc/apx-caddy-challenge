@@ -26,6 +26,8 @@ type AppRef interface {
 	VerifyTokenTTL() time.Duration
 	VerifyScoring() string
 	VerifyBodyCap() int64
+	// PassPolicy is the pass-cookie lifetime / binding policy (pass_* keys).
+	PassPolicy() PassPolicy
 	// ReplayLRU is the process-wide, app-owned set of recently-seen verify-token
 	// nonces. Shared across all verify routes so a token is single-use per machine.
 	ReplayLRU() *NonceLRU
@@ -65,6 +67,19 @@ type ChallengeApp struct {
 	// number of releases.
 	VerifyMinFillMsCfg int64 `json:"verify_min_fill_ms,omitempty"`
 
+	// Pass-cookie policy (all optional; zero/absent = the original behaviour:
+	// 10-minute non-rolling cookie bound to the client /24 or /64).
+	// pass_idle_ttl_seconds: cookie lifetime from issue or last renewal.
+	// pass_max_ttl_seconds: absolute cap from the original solve; rolling
+	// renewal is on only when it exceeds the idle TTL.
+	// pass_ipv4_prefix / pass_ipv6_prefix: client-network width the cookie binds to.
+	// pass_bind_user_agent: also bind the cookie to a hash of the User-Agent.
+	PassIdleTTLSecondsCfg int  `json:"pass_idle_ttl_seconds,omitempty"`
+	PassMaxTTLSecondsCfg  int  `json:"pass_max_ttl_seconds,omitempty"`
+	PassIPv4PrefixCfg     int  `json:"pass_ipv4_prefix,omitempty"`
+	PassIPv6PrefixCfg     int  `json:"pass_ipv6_prefix,omitempty"`
+	PassBindUserAgentCfg  bool `json:"pass_bind_user_agent,omitempty"`
+
 	logger     *zap.Logger
 	secret     string
 	difficulty int
@@ -75,11 +90,19 @@ type ChallengeApp struct {
 	verifyScoring    string
 	verifyBodyCap    int64
 	replayLRU        *NonceLRU
+	passPolicy       PassPolicy
 }
 
 // defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
 // single-use — cluster-wide uniqueness is not attempted.
 const defaultReplayLRUSize = 65536
+
+// processReplayLRU is the seen-nonce set every ChallengeApp shares. It lives
+// at package level so a config reload (which re-provisions the app) does not
+// forget which tokens and solved challenges were already used. Nonces are
+// random and only recorded after HMAC verification, so one set is safe across
+// secrets.
+var processReplayLRU = NewNonceLRU(defaultReplayLRUSize)
 
 func (*ChallengeApp) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -121,9 +144,65 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.verifyBodyCap = a.VerifyBodyCapBytesCfg; a.verifyBodyCap <= 0 {
 		a.verifyBodyCap = 1 << 20
 	}
-	a.replayLRU = NewNonceLRU(defaultReplayLRUSize)
+	a.replayLRU = processReplayLRU
+
+	pol, err := buildPassPolicy(a.PassIdleTTLSecondsCfg, a.PassMaxTTLSecondsCfg,
+		a.PassIPv4PrefixCfg, a.PassIPv6PrefixCfg, a.PassBindUserAgentCfg)
+	if err != nil {
+		return err
+	}
+	a.passPolicy = pol
 
 	return nil
+}
+
+// Pass-policy bounds. Ranges keep a misconfiguration from silently producing a
+// cookie that is either useless or far more portable than intended.
+const (
+	minPassIdleTTLSeconds = 60
+	maxPassIdleTTLSeconds = 86400  // 1 day
+	maxPassMaxTTLSeconds  = 604800 // 7 days
+	minPassIPv4Prefix     = 16
+	maxPassIPv4Prefix     = 32
+	minPassIPv6Prefix     = 32
+	maxPassIPv6Prefix     = 128
+)
+
+func buildPassPolicy(idleS, maxS, v4, v6 int, bindUA bool) (PassPolicy, error) {
+	pol := DefaultPassPolicy()
+	switch {
+	case idleS < 0:
+		return pol, fmt.Errorf("apx_challenge app: pass_idle_ttl_seconds must not be negative (got %d)", idleS)
+	case idleS > 0 && (idleS < minPassIdleTTLSeconds || idleS > maxPassIdleTTLSeconds):
+		return pol, fmt.Errorf("apx_challenge app: pass_idle_ttl_seconds must be %d-%d (got %d)", minPassIdleTTLSeconds, maxPassIdleTTLSeconds, idleS)
+	case idleS > 0:
+		pol.IdleTTL = time.Duration(idleS) * time.Second
+	}
+	pol.MaxTTL = pol.IdleTTL
+	switch {
+	case maxS < 0:
+		return pol, fmt.Errorf("apx_challenge app: pass_max_ttl_seconds must not be negative (got %d)", maxS)
+	case maxS > maxPassMaxTTLSeconds:
+		return pol, fmt.Errorf("apx_challenge app: pass_max_ttl_seconds must be at most %d (got %d)", maxPassMaxTTLSeconds, maxS)
+	case maxS > 0 && time.Duration(maxS)*time.Second < pol.IdleTTL:
+		return pol, fmt.Errorf("apx_challenge app: pass_max_ttl_seconds (%d) must be 0 or at least pass_idle_ttl_seconds (%d)", maxS, int(pol.IdleTTL.Seconds()))
+	case maxS > 0:
+		pol.MaxTTL = time.Duration(maxS) * time.Second
+	}
+	if v4 != 0 {
+		if v4 < minPassIPv4Prefix || v4 > maxPassIPv4Prefix {
+			return pol, fmt.Errorf("apx_challenge app: pass_ipv4_prefix must be %d-%d (got %d)", minPassIPv4Prefix, maxPassIPv4Prefix, v4)
+		}
+		pol.IPv4Prefix = v4
+	}
+	if v6 != 0 {
+		if v6 < minPassIPv6Prefix || v6 > maxPassIPv6Prefix {
+			return pol, fmt.Errorf("apx_challenge app: pass_ipv6_prefix must be %d-%d (got %d)", minPassIPv6Prefix, maxPassIPv6Prefix, v6)
+		}
+		pol.IPv6Prefix = v6
+	}
+	pol.BindUserAgent = bindUA
+	return pol, nil
 }
 
 func (a *ChallengeApp) Start() error { return nil }
@@ -138,6 +217,7 @@ func (a *ChallengeApp) VerifyTokenTTL() time.Duration { return a.verifyTokenTTL 
 func (a *ChallengeApp) VerifyScoring() string         { return a.verifyScoring }
 func (a *ChallengeApp) VerifyBodyCap() int64          { return a.verifyBodyCap }
 func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }
+func (a *ChallengeApp) PassPolicy() PassPolicy        { return a.passPolicy }
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)

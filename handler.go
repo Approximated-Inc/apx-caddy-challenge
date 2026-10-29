@@ -59,11 +59,17 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		return h.handleVerify(w, r, ip)
 	}
 
-	if c, err := r.Cookie(CookieName); err == nil && VerifyCookie(h.app.Secret(), c.Value, ip) {
-		setOutcome(r, "passed_recently")
-		clearTriesCookie(w, r) // apx-challenge-failure-states: pass cookie works, reset the loop breaker
-		// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
-		return next.ServeHTTP(w, r)
+	if c, err := r.Cookie(CookieName); err == nil {
+		pol, now := h.app.PassPolicy(), time.Now()
+		if pc, ok := VerifyPassCookie(h.app.Secret(), pol, c.Value, ip, r.UserAgent(), now); ok {
+			if exp, renew := pol.Renewal(pc, now); renew {
+				setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp), exp, now)
+			}
+			setOutcome(r, "passed_recently")
+			clearTriesCookie(w, r) // apx-challenge-failure-states: pass cookie works, reset the loop breaker
+			// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
+			return next.ServeHTTP(w, r)
+		}
 	}
 
 	if isWebSocketOrSSE(r) {
@@ -81,7 +87,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	setOutcome(r, "issued")
-	tok := IssueChallenge(h.app.Secret(), ip, safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
+	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
 	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath(), r.URL.RequestURI(), defaultChallengeTimeoutMs)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
@@ -95,8 +101,9 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	challenge := r.FormValue("challenge")
 	solution := r.FormValue("solution")
 
-	p, err := VerifyChallenge(h.app.Secret(), challenge, ip)
-	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) {
+	pol, now := h.app.PassPolicy(), time.Now()
+	p, err := VerifyPassChallenge(h.app.Secret(), pol, challenge, ip, r.UserAgent(), now)
+	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) || h.replayedSolve(pol, p) {
 		setOutcome(r, "failed")
 		if !isBrowserFormPost(r) {
 			w.WriteHeader(http.StatusForbidden)
@@ -120,15 +127,10 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		w.WriteHeader(http.StatusSeeOther)
 		return nil
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     CookieName,
-		Value:    IssueCookie(h.app.Secret(), ip, time.Now().Add(cookieTTL)),
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(cookieTTL.Seconds()),
-	})
+	// The cap counts from the challenge's issue, so replaying a token can't reset it.
+	iat := p.IssuedAt(challengeTokenTTL)
+	exp := pol.InitialExp(iat, now)
+	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), iat, exp), exp, now)
 	setOutcome(r, "passed")
 	st := readTries(r, h.app.Secret())
 	counted := st.countPass(time.Now())
@@ -147,6 +149,15 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+// replayedSolve marks a verified solve as spent and reports whether it was
+// already spent. Under a non-default policy a solved challenge is single-use
+// per machine, so one solve can't mint a cookie per address or UA; a replay
+// takes the failure path (403, or the browser recovery redirect). The default
+// policy keeps solves reusable, as before.
+func (h *ChallengeHandler) replayedSolve(pol PassPolicy, p ChallengePayload) bool {
+	return pol != DefaultPassPolicy() && h.app.ReplayLRU().Seen("chal:"+p.Nonce)
 }
 
 // writeContinuePage serves the 200 "Continuing…" page that sends the browser

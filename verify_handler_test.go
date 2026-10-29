@@ -26,6 +26,7 @@ func (verifyTestApp) VerifyTokenTTL() time.Duration { return 600 * time.Second }
 func (verifyTestApp) VerifyScoring() string         { return "off" }
 func (verifyTestApp) VerifyBodyCap() int64          { return 1 << 20 }
 func (verifyTestApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }
+func (verifyTestApp) PassPolicy() PassPolicy        { return DefaultPassPolicy() }
 
 func newFakeApp() AppRef { return verifyTestApp{} }
 
