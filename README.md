@@ -30,8 +30,9 @@ Stateless server-side (the cookie is the proof — no challenge table).
    Retry-After: 30`.
 
 The handler sets the `apx_challenge_outcome` request var
-(`issued | passed | passed_recently | failed`) for the apx-caddy-stats recorder
-(Phase 9c).
+(`issued | passed | passed_fallback | passed_recently | failed`) for the
+apx-caddy-stats recorder (Phase 9c). `passed_fallback` appears only when the
+render-check fallback below is on. The fallback pixel request sets no outcome.
 
 ## Config (emitted by Phoenix — not hand-written)
 
@@ -137,6 +138,84 @@ Binding would need the fingerprint carried across that hop (a custom PROXY v2
 TLV written by caddy-l4's proxy handler and read back by an HTTP listener
 wrapper into a request var or placeholder), plus an image rollout of both.
 
+### Render-check fallback (optional, off by default)
+
+The challenge answers "is this a browser?", not "is this a human?". Some real
+browsers can't run the proof-of-work script (old TV browsers, locked-down
+setups, script-blocking extensions). With `fallback_enabled`, the page also
+offers a plain HTML form with a **Continue** button, shown in the `<noscript>`
+block and in the failure panel (after a stall, timeout or error). It needs no
+JavaScript, and it passes only when the visitor behaves like a browser that
+renders the page, which simple HTTP clients (curl, scripts, scrapers) don't.
+
+A fallback POST (`mode=fallback`, to `verify_path`) passes only when all hold:
+
+1. **Token.** The form's `fallback` token verifies (HMAC under its own
+   `fallback` label, unexpired, 10-minute life), for the same client prefix
+   and (under `pass_bind_user_agent`) the same UA as the pass-cookie policy.
+2. **Cookie round-trip.** The request carries `__Host-apx-challenge-fallback`
+   (Secure, HttpOnly, SameSite=Lax, Path=/, Max-Age 600), set by the challenge
+   response and signed over the token's nonce.
+3. **Render proof.** The page's inline `<style>` gives an element inside the
+   form a CSS `background-image` of a signed 1×1 GIF at
+   `verify_path?apx_fallback_pixel=<nonce>.<sig>`. Serving it (`Cache-Control:
+   no-store`; a bad signature is a 404) records the nonce as rendered in a
+   bounded per-process set. The POST needs the nonce recorded on this machine.
+   The pixel uses the verify path, so the existing verify route reaches it
+   (Caddy's `path` matcher ignores the query); no new route is needed.
+4. **Dwell.** At least `fallback_min_dwell_seconds` since the token was issued.
+5. **Single use.** The nonce is spent on success (shared replay LRU).
+6. **Budget.** At most `fallback_max_per_hour` fallback passes per client
+   prefix (the pass policy's width) per hour, per machine.
+
+A pass sets the normal `apx-challenge` cookie, but non-rolling (no issued-at,
+so it is never renewed) and with `fallback_pass_ttl_seconds` as its lifetime,
+clears the fallback cookie, sets the outcome `passed_fallback` and continues
+like a solve (tries counting, 303 to the original URL). Any failure takes the
+same path as a failed solve: a 403 for scripts, and for a browser form post a
+counted failure plus a redirect to a fresh challenge (the explanation page at
+the threshold).
+
+| Key | Default | Allowed | Effect |
+|-----|---------|---------|--------|
+| `fallback_enabled` | `false` | bool | Offer the fallback. Off: no markup, cookie, pixel or `mode=fallback` handling; the page is byte-identical to before. |
+| `fallback_pass_ttl_seconds` | `600` | 60–86400 | Lifetime of the non-rolling pass cookie a fallback pass earns. |
+| `fallback_max_per_hour` | `3` | 1–1000 | Fallback passes per client prefix per hour, per machine. |
+| `fallback_min_dwell_seconds` | `2` | 1–60 | Minimum time from page issue to the POST. |
+
+**Per machine.** Rendered nonces, spent nonces and the hourly budget are kept
+per process (they survive config reloads) and never shared. When the pixel and
+the POST land on different machines, the POST finds nothing recorded and fails
+safely into a fresh challenge; the visitor tries again. A browser usually
+sends both over one connection, so this is rare. The budget is per machine, so
+a cluster allows up to `fallback_max_per_hour` × machines per prefix.
+
+**What it does not stop.** A client that keeps cookies, parses the page's CSS,
+fetches the pixel and waits two seconds passes. The fallback raises the bar to
+"behaves like a rendering browser", the hourly budget limits how many cookies
+one network gets that way, and the shorter, non-rolling cookie limits what
+each is worth. Text browsers that ignore CSS (lynx, w3m) fail it.
+
+**CSP.** The pixel is an image load, so it needs `img-src` to allow the site.
+Per-IP ledger routes serve the page with no CSP, so it works there. Edge
+sequence challenge routes get the app's response-guard CSP, which today is
+`default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';
+form-action 'self'; base-uri 'none'; frame-ancestors 'none'`. With no
+`img-src`, `default-src 'none'` blocks the pixel, so the fallback always fails
+(safely, into a fresh challenge) on those routes until the app adds
+`img-src 'self'`:
+
+    default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'
+
+No CSP-compatible alternative exists under `default-src 'none'`: every
+subresource fetch (images, fonts, frames, stylesheets, prefetch) falls back to
+it, and only the form navigation is allowed.
+
+**Rollout.** Same as the `pass_*` keys: an older image rejects a config with a
+`fallback_*` key (strict unmarshal), so the app must gate them on an image
+capability, and should ship the CSP change above before enabling the fallback
+on edge-sequence challenges.
+
 ## Build (xcaddy — image step)
 
 Add this module to the fleet image's `xcaddy build` line in the Approximated
@@ -186,7 +265,9 @@ challenge later requires propagating `tls_ja3`/`tls_ja4` across the L4→L7 hop
 Go tests cover PoW solve/verify, cookie/token HMAC (incl. cross-protocol +
 prefix binding), the pass-cookie policy (default cookies byte-identical to the
 pre-policy format in both directions, renewal window and cap, prefix widths, UA
-binding, config validation), the handler (serve/verify/cookie-gate/non-browser/outcome var),
-and page rendering. The real browser solve-and-redirect (incl. slow network +
+binding, config validation), the render-check fallback (each pass condition
+and its failure, the pixel endpoint, the non-rolling cookie, the off switch,
+and a golden test that the default page is byte-identical to before), the
+handler (serve/verify/cookie-gate/non-browser/outcome var), and page rendering. The real browser solve-and-redirect (incl. slow network +
 budget mobile to validate difficulty-16 solve time) is verified on the canary,
 not in CI.

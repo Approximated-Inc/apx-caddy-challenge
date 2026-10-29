@@ -31,6 +31,10 @@ type AppRef interface {
 	// ReplayLRU is the process-wide, app-owned set of recently-seen verify-token
 	// nonces. Shared across all verify routes so a token is single-use per machine.
 	ReplayLRU() *NonceLRU
+	// Fallback is the render-check fallback config (fallback_* keys).
+	Fallback() FallbackConfig
+	// FallbackState is the process-wide rendered-nonce set and pass budget.
+	FallbackState() *FallbackState
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -80,6 +84,16 @@ type ChallengeApp struct {
 	PassIPv6PrefixCfg     int  `json:"pass_ipv6_prefix,omitempty"`
 	PassBindUserAgentCfg  bool `json:"pass_bind_user_agent,omitempty"`
 
+	// Render-check fallback (all optional; absent = off, page unchanged).
+	// fallback_enabled: offer the no-JavaScript fallback form.
+	// fallback_pass_ttl_seconds: non-rolling pass-cookie lifetime it earns.
+	// fallback_max_per_hour: fallback passes per client prefix per hour, per machine.
+	// fallback_min_dwell_seconds: minimum time from page issue to the POST.
+	FallbackEnabledCfg         bool `json:"fallback_enabled,omitempty"`
+	FallbackPassTTLSecondsCfg  int  `json:"fallback_pass_ttl_seconds,omitempty"`
+	FallbackMaxPerHourCfg      int  `json:"fallback_max_per_hour,omitempty"`
+	FallbackMinDwellSecondsCfg int  `json:"fallback_min_dwell_seconds,omitempty"`
+
 	logger     *zap.Logger
 	secret     string
 	difficulty int
@@ -91,6 +105,7 @@ type ChallengeApp struct {
 	verifyBodyCap    int64
 	replayLRU        *NonceLRU
 	passPolicy       PassPolicy
+	fallback         FallbackConfig
 }
 
 // defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
@@ -152,6 +167,13 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 		return err
 	}
 	a.passPolicy = pol
+
+	fb, err := buildFallbackConfig(a.FallbackEnabledCfg, a.FallbackPassTTLSecondsCfg,
+		a.FallbackMaxPerHourCfg, a.FallbackMinDwellSecondsCfg)
+	if err != nil {
+		return err
+	}
+	a.fallback = fb
 
 	return nil
 }
@@ -218,6 +240,8 @@ func (a *ChallengeApp) VerifyScoring() string         { return a.verifyScoring }
 func (a *ChallengeApp) VerifyBodyCap() int64          { return a.verifyBodyCap }
 func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }
 func (a *ChallengeApp) PassPolicy() PassPolicy        { return a.passPolicy }
+func (a *ChallengeApp) Fallback() FallbackConfig      { return a.fallback }
+func (a *ChallengeApp) FallbackState() *FallbackState { return processFallbackState }
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)

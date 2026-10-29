@@ -27,6 +27,8 @@ func (verifyTestApp) VerifyScoring() string         { return "off" }
 func (verifyTestApp) VerifyBodyCap() int64          { return 1 << 20 }
 func (verifyTestApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }
 func (verifyTestApp) PassPolicy() PassPolicy        { return DefaultPassPolicy() }
+func (verifyTestApp) Fallback() FallbackConfig      { return FallbackConfig{} }
+func (verifyTestApp) FallbackState() *FallbackState { return NewFallbackState(1024) }
 
 func newFakeApp() AppRef { return verifyTestApp{} }
 
