@@ -1,6 +1,7 @@
 package apxchallenge
 
 import (
+	"container/heap"
 	"container/list"
 	"crypto/hmac"
 	"crypto/rand"
@@ -41,7 +42,7 @@ const (
 
 	fallbackRateWindow = time.Hour
 
-	defaultFallbackPassTTLSeconds  = 600
+	defaultFallbackPassTTLSeconds  = 300
 	defaultFallbackMaxPerHour      = 3
 	defaultFallbackMinDwellSeconds = 2
 	minFallbackPassTTLSeconds      = 60
@@ -115,7 +116,12 @@ func NewFallbackState(size int) *FallbackState {
 // processFallbackState lives at package level for the same reason as
 // processReplayLRU: a config reload must not forget rendered nonces or reset
 // the pass budget.
-var processFallbackState = NewFallbackState(defaultReplayLRUSize)
+var processFallbackState = NewFallbackState(fallbackStoreSize)
+
+// fallbackStoreSize bounds each fallback store. Records live for the token's
+// 10 minutes, so this is the live window, not history (all three stores
+// full measured about 6.5 MB). See the README for the eviction bound.
+const fallbackStoreSize = 16384
 
 // fallbackPayload is the signed body of a fallback form token.
 type fallbackPayload struct {
@@ -321,6 +327,21 @@ func isFallbackPixelRequest(r *http.Request, verifyPath string) bool {
 	return r.URL.Path == verifyPath && r.URL.Query().Has(fallbackPixelParam)
 }
 
+// isImageLoad reports whether a pixel request looks like a browser loading an
+// image: a GET with Sec-Fetch-Dest: image when any Sec-Fetch header is sent,
+// or, from browsers without Sec-Fetch, an Accept header naming an image type.
+// Anything else still gets the image but is not recorded as a render.
+func isImageLoad(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	if r.Header.Get("Sec-Fetch-Dest") != "" || r.Header.Get("Sec-Fetch-Mode") != "" ||
+		r.Header.Get("Sec-Fetch-Site") != "" || r.Header.Get("Sec-Fetch-User") != "" {
+		return r.Header.Get("Sec-Fetch-Dest") == "image"
+	}
+	return strings.Contains(r.Header.Get("Accept"), "image/")
+}
+
 // serveFallbackPixel records a well-signed nonce as rendered on this machine
 // and returns the image. Anything else is a 404 and records nothing.
 func (h *ChallengeHandler) serveFallbackPixel(w http.ResponseWriter, r *http.Request) error {
@@ -331,7 +352,9 @@ func (h *ChallengeHandler) serveFallbackPixel(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusNotFound)
 		return nil
 	}
-	h.app.FallbackState().Rendered.Add(nonce, exp, now)
+	if isImageLoad(r) {
+		h.app.FallbackState().Rendered.Add(nonce, exp, now)
+	}
 	w.Header().Set("Content-Type", "image/gif")
 	w.Header().Set("Content-Length", strconv.Itoa(len(transparentGIF)))
 	w.WriteHeader(http.StatusOK)
@@ -342,10 +365,10 @@ func (h *ChallengeHandler) serveFallbackPixel(w http.ResponseWriter, r *http.Req
 }
 
 // fallbackFailure names the first pass condition a fallback POST misses, or
-// "" when it passes. Nothing is recorded until every other condition holds:
-// then the pass is counted against the prefix's budget and the nonce spent.
-// Two concurrent posts of one nonce can both use a budget slot; only one
-// passes.
+// "" when it passes. The nonce is claimed (spent) atomically before the
+// budget is charged, so concurrent replays of one nonce lose the claim and
+// use no budget. A claimed nonce that then hits the budget stays spent; the
+// visitor gets a fresh challenge anyway.
 func (h *ChallengeHandler) fallbackFailure(r *http.Request, p fallbackPayload, now time.Time) string {
 	fb, st := h.app.Fallback(), h.app.FallbackState()
 	exp := time.Unix(p.Exp, 0)
@@ -356,12 +379,10 @@ func (h *ChallengeHandler) fallbackFailure(r *http.Request, p fallbackPayload, n
 		return "not_rendered"
 	case now.Sub(time.UnixMilli(p.Iat)) < fb.MinDwell:
 		return "too_fast"
-	case st.Spent.Has(p.Nonce, now):
+	case !st.Spent.AddIfAbsent(p.Nonce, exp, now):
 		return "replayed"
 	case !st.Limiter.Allow(p.Prefix, fb.MaxPerHour, now):
 		return "rate_limited"
-	case !st.Spent.AddIfAbsent(p.Nonce, exp, now):
-		return "replayed"
 	}
 	return ""
 }
@@ -516,25 +537,55 @@ func (l *FallbackLimiter) Allow(key string, n int, now time.Time) bool {
 }
 
 // ExpiringSet is a bounded, concurrency-safe set of keys that each expire.
-// Expired keys count as absent; past max entries the least recently added
-// is evicted.
+// Expired keys count as absent and are dropped on the next add. Past max
+// entries, the record that expires soonest is evicted, so an expired record
+// always goes before a live one.
 type ExpiringSet struct {
 	mu  sync.Mutex
 	max int
-	ll  *list.List // front = most recently added
-	m   map[string]*list.Element
+	h   expiringHeap // min-heap by exp
+	m   map[string]*expiringEntry
 }
 
 type expiringEntry struct {
-	key string
-	exp int64 // unix seconds; the key is live while now <= exp
+	key   string
+	exp   int64 // unix seconds; the key is live while now <= exp
+	index int   // position in the heap
+}
+
+type expiringHeap []*expiringEntry
+
+func (h expiringHeap) Len() int           { return len(h) }
+func (h expiringHeap) Less(i, j int) bool { return h[i].exp < h[j].exp }
+func (h expiringHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index, h[j].index = i, j
+}
+func (h *expiringHeap) Push(x any) {
+	e := x.(*expiringEntry)
+	e.index = len(*h)
+	*h = append(*h, e)
+}
+func (h *expiringHeap) Pop() any {
+	old := *h
+	e := old[len(old)-1]
+	old[len(old)-1] = nil
+	*h = old[:len(old)-1]
+	return e
 }
 
 func NewExpiringSet(max int) *ExpiringSet {
 	if max <= 0 {
 		max = 1
 	}
-	return &ExpiringSet{max: max, ll: list.New(), m: make(map[string]*list.Element)}
+	return &ExpiringSet{max: max, m: make(map[string]*expiringEntry)}
+}
+
+// Len is the number of records held, live or not yet dropped.
+func (s *ExpiringSet) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.h)
 }
 
 // Add records key until exp, replacing any earlier record.
@@ -564,24 +615,24 @@ func (s *ExpiringSet) Has(key string, now time.Time) bool {
 }
 
 func (s *ExpiringSet) live(key string, now time.Time) bool {
-	el, ok := s.m[key]
-	return ok && now.Unix() <= el.Value.(*expiringEntry).exp
+	e, ok := s.m[key]
+	return ok && now.Unix() <= e.exp
 }
 
 func (s *ExpiringSet) add(key string, exp, now time.Time) {
-	if el, ok := s.m[key]; ok {
-		s.ll.Remove(el)
-		delete(s.m, key)
+	if e, ok := s.m[key]; ok {
+		e.exp = exp.Unix()
+		heap.Fix(&s.h, e.index)
+	} else {
+		e := &expiringEntry{key: key, exp: exp.Unix()}
+		heap.Push(&s.h, e)
+		s.m[key] = e
 	}
-	s.m[key] = s.ll.PushFront(&expiringEntry{key: key, exp: exp.Unix()})
-	// Drop expired records from the old end, then evict down to max.
-	for back := s.ll.Back(); back != nil && back.Value.(*expiringEntry).exp < now.Unix(); back = s.ll.Back() {
-		s.ll.Remove(back)
-		delete(s.m, back.Value.(*expiringEntry).key)
+	// Drop expired records, then evict the soonest-expiring down to max.
+	for len(s.h) > 0 && s.h[0].exp < now.Unix() {
+		delete(s.m, heap.Pop(&s.h).(*expiringEntry).key)
 	}
-	for s.ll.Len() > s.max {
-		back := s.ll.Back()
-		s.ll.Remove(back)
-		delete(s.m, back.Value.(*expiringEntry).key)
+	for len(s.h) > s.max {
+		delete(s.m, heap.Pop(&s.h).(*expiringEntry).key)
 	}
 }

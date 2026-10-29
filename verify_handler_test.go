@@ -252,9 +252,13 @@ func TestVerifyTokenRefusedOnBadPoW(t *testing.T) {
 		Difficulty int    `json:"difficulty"`
 	}
 	_ = json.Unmarshal(chRec.Body.Bytes(), &ch)
+	if ch.Challenge == "" || ch.Difficulty <= 0 {
+		t.Fatalf("challenge response: %s", chRec.Body)
+	}
 
 	tokReq := postReqHost("/__apx_verify/token", "203.0.113.5", "shop.example.com",
-		formBody(map[string]string{"challenge": ch.Challenge, "solution": "wrong", "probes": `{"fill_ms":5000}`}))
+		// A solution proven to miss the difficulty ("wrong" met it ~1 in 16).
+		formBody(map[string]string{"challenge": ch.Challenge, "solution": failingSolution(ch.Challenge, ch.Difficulty), "probes": `{"fill_ms":5000}`}))
 	tokRec := httptest.NewRecorder()
 	_ = eh.ServeHTTP(tokRec, tokReq, emptyNext)
 	if tokRec.Code != 200 {

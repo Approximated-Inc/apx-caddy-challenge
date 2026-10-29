@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,7 +186,7 @@ func TestFallbackGoldenPages(t *testing.T) {
 func TestFallbackIsOnByDefault(t *testing.T) {
 	app := &ChallengeApp{SecretCfg: "s"}
 	require.NoError(t, app.Provision(caddy.Context{}))
-	require.Equal(t, FallbackConfig{Enabled: true, PassTTL: 600 * time.Second, MaxPerHour: 3, MinDwell: 2 * time.Second}, app.Fallback())
+	require.Equal(t, FallbackConfig{Enabled: true, PassTTL: 300 * time.Second, MaxPerHour: 3, MinDwell: 2 * time.Second}, app.Fallback())
 
 	h := &ChallengeHandler{app: app}
 	w := httptest.NewRecorder()
@@ -515,16 +516,16 @@ func TestFallbackPixelEndpoint(t *testing.T) {
 		require.Equal(t, http.StatusNotFound, w.Code, tc.name)
 		require.Equal(t, "no-store", w.Header().Get("Cache-Control"), tc.name)
 		require.Empty(t, w.Body.String(), tc.name)
-		require.Equal(t, 0, app.state.Rendered.ll.Len(), tc.name)
+		require.Equal(t, 0, app.state.Rendered.Len(), tc.name)
 	}
 
-	// HEAD records too but sends no body.
+	// HEAD gets the image headers but is not a render.
 	app.state = NewFallbackState(16)
 	h.app = app
 	w = get(good, fbIP, fbUA, "HEAD")
 	require.Equal(t, 200, w.Code)
 	require.Empty(t, w.Body.Bytes())
-	require.True(t, app.state.Rendered.Has(nonce, now))
+	require.False(t, app.state.Rendered.Has(nonce, now))
 }
 
 func TestFallbackRenderEscapes(t *testing.T) {
@@ -548,12 +549,12 @@ func TestFallbackRenderEscapes(t *testing.T) {
 func TestFallbackConfigValidation(t *testing.T) {
 	fb, err := buildFallbackConfig(false, 0, 0, 0, 600*time.Second)
 	require.NoError(t, err)
-	require.Equal(t, FallbackConfig{PassTTL: 600 * time.Second, MaxPerHour: 3, MinDwell: 2 * time.Second}, fb)
+	require.Equal(t, FallbackConfig{PassTTL: 300 * time.Second, MaxPerHour: 3, MinDwell: 2 * time.Second}, fb)
 
 	// Never longer than a solved cookie: the default clamps, an explicit value errors.
-	fb, err = buildFallbackConfig(true, 0, 0, 0, 300*time.Second)
+	fb, err = buildFallbackConfig(true, 0, 0, 0, 120*time.Second)
 	require.NoError(t, err)
-	require.Equal(t, 300*time.Second, fb.PassTTL)
+	require.Equal(t, 120*time.Second, fb.PassTTL)
 	_, err = buildFallbackConfig(true, 301, 0, 0, 300*time.Second)
 	require.ErrorContains(t, err, "must not exceed the pass idle TTL")
 	fb, err = buildFallbackConfig(true, 300, 0, 0, 300*time.Second)
@@ -620,10 +621,11 @@ func TestFallbackNeverTouchesSharedReplayLRU(t *testing.T) {
 	require.NotNil(t, respCookie(w, CookieName))
 	require.True(t, app.state.Spent.Has(first, time.Now()))
 
-	// Over the budget: fails, and the nonce is not spent.
+	// Over the budget: fails. The nonce was claimed before the budget was
+	// checked, so it stays spent (the visitor gets a fresh challenge).
 	w, second := pass("203.0.113.6")
 	require.Nil(t, respCookie(w, CookieName))
-	require.False(t, app.state.Spent.Has(second, time.Now()), "a rate-denied attempt must not spend its nonce")
+	require.True(t, app.state.Spent.Has(second, time.Now()), "the nonce is claimed before the budget")
 
 	require.Equal(t, 0, app.replay.ll.Len(), "fallback must not write the shared replay LRU")
 }
@@ -736,14 +738,14 @@ func TestExpiringSet(t *testing.T) {
 	s2 := NewExpiringSet(10)
 	s2.Add("old", now, now)
 	s2.Add("new", now.Add(time.Hour), now.Add(time.Minute))
-	require.Equal(t, 1, s2.ll.Len())
+	require.Equal(t, 1, s2.Len())
 
-	// Bounded: past max, the least recently added goes.
+	// Bounded: past max, the soonest-expiring goes.
 	s3 := NewExpiringSet(2)
 	for _, k := range []string{"p", "q", "r"} {
 		s3.Add(k, now.Add(time.Hour), now)
 	}
-	require.Equal(t, 2, s3.ll.Len())
+	require.Equal(t, 2, s3.Len())
 	require.False(t, s3.Has("p", now))
 	require.True(t, s3.Has("r", now))
 }
@@ -763,4 +765,162 @@ func TestFallbackReplayDoesNotUseBudget(t *testing.T) {
 	fetchPixel(t, h, q.pixel, fbIP)
 	w := postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, q.token, fbIP, fbUA, 3*time.Second), "/r", q.cookie))
 	require.NotNil(t, respCookie(w, CookieName))
+}
+
+func TestExpiringSetEvictsExpiredBeforeLive(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	s := NewExpiringSet(2)
+	s.Add("long", now.Add(time.Hour), now)
+	s.Add("short", now.Add(5*time.Second), now)
+	// Re-adding a soon-expiring record must not put it ahead of a longer one.
+	s.Add("short", now.Add(6*time.Second), now.Add(time.Second))
+	// Later, "short" has expired; a new record must evict it, not "long".
+	s.Add("new", now.Add(time.Hour), now.Add(10*time.Second))
+	at := now.Add(10 * time.Second)
+	require.True(t, s.Has("long", at), "live record kept")
+	require.True(t, s.Has("new", at))
+	require.Equal(t, 2, s.Len())
+
+	// All live and full: the soonest-expiring goes, whatever the insert order.
+	s2 := NewExpiringSet(2)
+	s2.Add("late", now.Add(time.Hour), now)
+	s2.Add("soon", now.Add(time.Minute), now)
+	s2.Add("mid", now.Add(30*time.Minute), now)
+	require.False(t, s2.Has("soon", now))
+	require.True(t, s2.Has("late", now))
+	require.True(t, s2.Has("mid", now))
+}
+
+func TestFallbackImageLoadDetection(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		headers      map[string]string
+		want         bool
+	}{
+		{"modern image load", "GET", map[string]string{"Sec-Fetch-Dest": "image", "Sec-Fetch-Mode": "no-cors", "Accept": "image/avif,image/webp,*/*"}, true},
+		{"modern document", "GET", map[string]string{"Sec-Fetch-Dest": "document", "Accept": "image/png"}, false},
+		{"Sec-Fetch without dest", "GET", map[string]string{"Sec-Fetch-Mode": "no-cors", "Accept": "image/png"}, false},
+		{"IE11 image", "GET", map[string]string{"Accept": "image/png, image/svg+xml, image/*;q=0.8, */*;q=0.5"}, true},
+		{"old Safari image", "GET", map[string]string{"Accept": "image/webp,image/png,image/svg+xml,image/*;q=0.8,video/*;q=0.8,*/*;q=0.5"}, true},
+		{"curl default", "GET", map[string]string{"Accept": "*/*"}, false},
+		{"no headers", "GET", nil, false},
+		{"HEAD", "HEAD", map[string]string{"Sec-Fetch-Dest": "image"}, false},
+		{"HEAD old browser", "HEAD", map[string]string{"Accept": "image/png"}, false},
+	} {
+		r := httptest.NewRequest(tc.method, "/", nil)
+		for k, v := range tc.headers {
+			r.Header.Set(k, v)
+		}
+		require.Equal(t, tc.want, isImageLoad(r), tc.name)
+	}
+}
+
+func TestFallbackScriptPixelLoadsDoNotCount(t *testing.T) {
+	for _, tc := range []struct {
+		name, method string
+		headers      map[string]string
+	}{
+		{"HEAD", "HEAD", map[string]string{"Accept": "image/png"}},
+		{"curl GET", "GET", map[string]string{"Accept": "*/*"}},
+		{"document GET", "GET", map[string]string{"Sec-Fetch-Dest": "document", "Accept": "text/html"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, app := fbHandler(DefaultPassPolicy(), enabledFallback())
+			p := issue(t, h, fbIP, fbUA, "/r")
+			pr := httptest.NewRequest(tc.method, p.pixel, nil)
+			pr.RemoteAddr = fbIP + ":443"
+			pr.Header.Set("User-Agent", fbUA)
+			for k, v := range tc.headers {
+				pr.Header.Set(k, v)
+			}
+			pw := httptest.NewRecorder()
+			require.NoError(t, h.ServeHTTP(pw, withVars(pr), nextOK))
+			require.Equal(t, 200, pw.Code, "still answered like an image")
+			r := fbPost(fbIP, fbUA, backdate(t, app, p.token, fbIP, fbUA, 3*time.Second), "/r", p.cookie)
+			requireFailed(t, postFallback(t, h, r), r, "/r")
+		})
+	}
+}
+
+func TestFallbackConcurrentReplaysPassOnceAndUseOneSlot(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		fb := enabledFallback()
+		fb.MaxPerHour = 1000
+		h, app := fbHandler(DefaultPassPolicy(), fb)
+		p := issue(t, h, fbIP, fbUA, "/r")
+		fetchPixel(t, h, p.pixel, fbIP)
+		tok := backdate(t, app, p.token, fbIP, fbUA, 3*time.Second)
+
+		const n = 32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		passes := make(chan bool, n)
+		for i := 0; i < n; i++ {
+			r := fbPost(fbIP, fbUA, tok, "/r", p.cookie)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				w := httptest.NewRecorder()
+				_ = h.ServeHTTP(w, r, nextOK)
+				passes <- respCookie(w, CookieName) != nil
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(passes)
+		got := 0
+		for ok := range passes {
+			if ok {
+				got++
+			}
+		}
+		require.Equal(t, 1, got, "exactly one pass")
+		tp, _ := verifyFallbackToken(fbSecret, app.pol, tok, fbIP, fbUA, time.Now())
+		app.state.Limiter.mu.Lock()
+		used := len(app.state.Limiter.m[tp.Prefix].Value.(*limiterEntry).times)
+		app.state.Limiter.mu.Unlock()
+		require.Equal(t, 1, used, "exactly one budget slot")
+	}
+}
+
+func TestFallbackInFlightTabsRecover(t *testing.T) {
+	// Two tabs load at once with the same (empty) cookie jar: the second
+	// response's cookie replaces the first, so tab A's nonce is lost.
+	h, app := fbHandler(DefaultPassPolicy(), enabledFallback())
+	a := issue(t, h, fbIP, fbUA, "/a")
+	b := issue(t, h, fbIP, fbUA, "/b")
+	fetchPixel(t, h, a.pixel, fbIP)
+	fetchPixel(t, h, b.pixel, fbIP)
+	ra := fbPost(fbIP, fbUA, backdate(t, app, a.token, fbIP, fbUA, 3*time.Second), "/a", b.cookie)
+	wa := postFallback(t, h, ra)
+	requireFailed(t, wa, ra, "/a")
+
+	// Tab A follows the redirect to a fresh challenge, which works.
+	rc := fbGet("/a", fbIP, fbUA)
+	rc.AddCookie(b.cookie)
+	wc := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(wc, rc, nextOK))
+	cTok := fbTokenRe.FindStringSubmatch(wc.Body.String())[1]
+	cPixel := fbPixelRe.FindStringSubmatch(wc.Body.String())[1]
+	jar := respCookie(wc, fallbackCookieName)
+	fetchPixel(t, h, cPixel, fbIP)
+	w := postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, cTok, fbIP, fbUA, 3*time.Second), "/a", jar))
+	require.NotNil(t, respCookie(w, CookieName), "the fresh challenge passes")
+	// And tab B's nonce survived in the jar.
+	require.NotNil(t, respCookie(postFallback(t, h, fbPost(fbIP, fbUA, backdate(t, app, b.token, fbIP, fbUA, 3*time.Second), "/b", jar)), CookieName))
+}
+
+func TestExpiringSetReAddReordersByNewExpiry(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	s := NewExpiringSet(3)
+	s.Add("a", now.Add(5*time.Second), now)
+	s.Add("b", now.Add(time.Hour), now)
+	s.Add("c", now.Add(90*time.Minute), now)
+	s.Add("a", now.Add(2*time.Hour), now) // "a" now outlives "b" and "c"
+	s.Add("d", now.Add(3*time.Hour), now)
+	require.True(t, s.Has("a", now), "re-added record ordered by its new expiry")
+	require.False(t, s.Has("b", now), "soonest-expiring evicted")
+	require.True(t, s.Has("c", now))
+	require.True(t, s.Has("d", now))
 }

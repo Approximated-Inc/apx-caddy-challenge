@@ -142,8 +142,8 @@ wrapper into a request var or placeholder), plus an image rollout of both.
 
 The challenge answers "is this a browser?", not "is this a human?". Some real
 browsers can't run the proof-of-work script (old TV browsers, locked-down
-setups, script-blocking extensions). The page also offers a plain HTML form with a **Continue** button, shown in the `<noscript>`
-block and in the failure panel (after a stall, timeout or error). It needs no
+setups, script-blocking extensions). The page also offers a plain HTML form
+with a **Continue** button, shown in the `<noscript>` block and in the failure panel (after a stall, timeout or error). It needs no
 JavaScript, and it passes only when the visitor behaves like a browser that
 renders the page, which simple HTTP clients (curl, scripts, scrapers) don't.
 
@@ -169,19 +169,27 @@ A fallback POST (`mode=fallback`, to `verify_path`) passes only when all hold:
    the nonce, the token's expiry and the requester's client prefix (plus the
    UA hash under `pass_bind_user_agent`), so a pixel URL works only until the
    token expires and only from the network (and UA) that loaded the page.
-   Serving it (`Cache-Control: no-store`; anything invalid is a 404 and
-   records nothing) records the nonce as rendered on this machine until the
-   token's expiry. The pixel uses the verify path, so the existing verify
+   Anything invalid is a 404 and records nothing (`Cache-Control: no-store`
+   throughout). A valid URL always gets the image, but only a request that
+   looks like a browser loading an image records the nonce as rendered on
+   this machine, until the token's expiry: a GET (never HEAD) that sends
+   `Sec-Fetch-Dest: image` when it sends any `Sec-Fetch-*` header, or, from
+   browsers without `Sec-Fetch-*`, an `Accept` header naming an `image/`
+   type (IE11, older Safari and Firefox all do). The pixel uses the verify path, so the existing verify
    route reaches it (Caddy's `path` matcher ignores the query); no new route
    is needed.
 4. **Dwell.** At least `fallback_min_dwell_seconds` since the token was issued.
-5. **Single use.** The nonce has not been spent by an earlier pass.
+5. **Single use.** The nonce is claimed (spent) atomically; a nonce already
+   claimed fails.
 6. **Budget.** Fewer than `fallback_max_per_hour` fallback passes from the
-   client prefix (the pass policy's width) in the last hour, on this machine.
+   client prefix in the last hour, on this machine. The prefix is the pass
+   policy's width (by default the /24 or /64), so everyone behind one office
+   or carrier-NAT /24 shares the budget.
 
-Nothing is recorded until every other condition holds; then the pass is
-counted against the budget and the nonce spent. A failed or rate-denied
-attempt spends nothing.
+Nothing is recorded until conditions 1–4 hold. The nonce is then claimed
+before the budget is charged, so concurrent replays of one nonce lose the
+claim and use no budget. A claimed nonce that then finds the budget used up
+stays spent; that visitor gets a fresh challenge anyway.
 
 A pass sets the normal `apx-challenge` cookie, but non-rolling (no issued-at,
 so it is never renewed) and with `fallback_pass_ttl_seconds` as its lifetime,
@@ -193,8 +201,8 @@ redirect to a fresh challenge (the explanation page at the threshold).
 | Key | Default | Allowed | Effect |
 |-----|---------|---------|--------|
 | `fallback_disabled` | `false` | bool | Emergency opt-out. When true: no markup, cookie, pixel or `mode=fallback` handling, and the page is byte-identical to the page before the fallback existed. |
-| `fallback_pass_ttl_seconds` | `600`, clamped to the pass idle TTL | 60 to the pass idle TTL | Lifetime of the non-rolling pass cookie a fallback pass earns. Never longer than a solved cookie's idle TTL: a larger explicit value fails provisioning, and the default is lowered to the idle TTL when that is shorter. |
-| `fallback_max_per_hour` | `3` | 1–1000 | Fallback passes per client prefix per hour, per machine. |
+| `fallback_pass_ttl_seconds` | `300`, clamped to the pass idle TTL | 60 to the pass idle TTL | Lifetime of the non-rolling pass cookie a fallback pass earns. Never longer than a solved cookie's idle TTL: a larger explicit value fails provisioning, and the default is lowered to the idle TTL when that is shorter. |
+| `fallback_max_per_hour` | `3` | 1–1000 | Fallback passes per client prefix (the pass policy's width, /24 or /64 by default) per hour, per machine. |
 | `fallback_min_dwell_seconds` | `2` | 1–60 | Minimum time from page issue to the POST. |
 
 **Per machine, and separate.** Rendered nonces, spent nonces and the hourly
@@ -207,22 +215,35 @@ visitor tries again. A browser usually sends both over one connection, so
 this is rare. The budget is per machine, so a cluster allows up to
 `fallback_max_per_hour` × machines per prefix.
 
-**Store bounds.** Each store holds at most 65,536 entries and drops a record
-once its token has expired, so it only has to hold the live 10-minute window.
-Past the cap the oldest record is evicted. Every rendered record needs a
-fresh challenge page and a pixel fetch from the attacker's own prefix, so to
-evict a real visitor's render record an attacker has to load about 65,536
-challenge pages and pixels within 10 minutes (about 110 a second, sustained,
-on that one machine). The visitor then fails once into a fresh challenge and
-can try again. Spent records exist only for passes, which the hourly budget
-limits per prefix, so evicting a spent record (to replay a nonce within its
-token's life) needs that many passes from many prefixes.
+**Store bounds.** Each store (rendered nonces, spent nonces, prefixes in the
+budget) holds at most 16,384 records; all three full measured about 6.5 MB. Records are
+dropped once their token has expired, so the stores only hold the live
+10-minute window. Past the cap the record that expires soonest is evicted, so
+an expired record always goes before a live one. Every rendered record needs
+a fresh challenge page and a pixel GET from the attacker's own prefix, so to
+evict a real visitor's render record an attacker has to load about 16,384
+challenge pages and pixels within that visitor's 10-minute window on the same
+machine (about 27 a second, sustained). The visitor then fails once into a
+fresh challenge and can try again. Spent records need a rendered nonce, a
+matching cookie and the dwell for each, so evicting one to replay a nonce
+within its token's life takes thousands of such attempts.
 
-**What it does not stop.** A client that keeps cookies, parses the page's CSS,
-fetches the pixel and waits two seconds passes. The fallback raises the bar to
-"behaves like a rendering browser", the hourly budget limits how many cookies
-one network gets that way, and the shorter, non-rolling cookie limits what
-each is worth. Text browsers that ignore CSS (lynx, w3m) fail it.
+**Tabs.** The cookie keeps the 4 most recent nonces, so tabs opened one after
+another all work. Two tabs whose challenge responses are in flight at the
+same time both start from the same cookie, so the later response's cookie
+drops the other tab's nonce. That tab's Continue fails once into a fresh
+challenge, which then works.
+
+**What it does not stop.** A script written for this page, one that keeps
+cookies, reads the CSS, sends a GET for the pixel with browser-like image
+headers and waits two seconds, passes, just as a headless browser passes the
+proof-of-work. The fallback stops generic HTTP clients (curl, scrapers that
+don't load subresources, HEAD probes), and the hourly budget limits how many
+cookies one network gets this way. The fallback cookie is non-rolling and
+lasts 300 s by default. Under the default pass policy a solved cookie is also
+non-rolling and lasts 600 s, so a fallback pass is worth half a solve; under a
+rolling policy the gap is larger. Text browsers that ignore CSS (lynx, w3m)
+fail it.
 
 **CSP.** The pixel is an image load, so `img-src` must allow the site. Whenever
 a cluster has an edge-sequence challenge or a reputation mode of `block` or
@@ -309,8 +330,10 @@ Go tests cover PoW solve/verify, cookie/token HMAC (incl. cross-protocol +
 prefix binding), the pass-cookie policy (default cookies byte-identical to the
 pre-policy format in both directions, renewal window and cap, prefix widths, UA
 binding, config validation), the render-check fallback (each pass condition
-and its failure, the pixel endpoint, the non-rolling cookie, the off switch,
-and a golden test that the default page is byte-identical to before), the
-handler (serve/verify/cookie-gate/non-browser/outcome var), and page rendering. The real browser solve-and-redirect (incl. slow network +
+and its failure, the pixel endpoint and what counts as a render, concurrent
+replays, the stores, the non-rolling cookie, the opt-out, a golden test that
+the opted-out page is byte-identical to the pre-fallback page, and a golden of
+the default page), the handler (serve/verify/cookie-gate/non-browser/outcome
+var), and page rendering. The real browser solve-and-redirect (incl. slow network +
 budget mobile to validate difficulty-16 solve time) is verified on the canary,
 not in CI.
