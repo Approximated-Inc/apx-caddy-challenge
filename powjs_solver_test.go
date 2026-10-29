@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ const powJSHarness = `
 var vm = require("vm"), fs = require("fs");
 var src = fs.readFileSync(process.argv[2], "utf8");
 var req = JSON.parse(process.argv[3]);
-var out = { mode: req.mode, hooks: [], workers: 0, digests: {}, lzb: {} };
+var out = { mode: req.mode, hooks: [], workers: 0, digests: {}, lzb: {}, mainSlices: 0, progress: [] };
 var t0 = Date.now();
 var finished = false;
 function finish() {
@@ -45,11 +46,13 @@ var blobs = {}, nblob = 0;
 var win = {
   setTimeout: setTimeout, clearTimeout: clearTimeout,
   document: {
-    hidden: false,
+    // pow.js reads this once per main-thread slice, never in the worker.
+    get hidden() { out.mainSlices++; return false; },
     getElementById: function (id) { return req.mode === "no-form" ? null : (id === "apx-challenge" ? form : null); }
   },
   apxChallengeFail: function (r) { out.hooks.push("fail:" + r); if (req.mode === "no-form") finish(); },
-  apxChallengeDone: function () { out.hooks.push("done"); }
+  apxChallengeDone: function () { out.hooks.push("done"); },
+  apxChallengeProgress: function (n) { out.progress.push(n); }
 };
 win.window = win;
 
@@ -169,7 +172,7 @@ func TestPowJSSolvesOnEveryPath(t *testing.T) {
 	cases := []struct {
 		mode      string
 		challenge string
-		worker    bool // solution came from the worker (not terminated by fallback first)
+		worker    bool // the worker supplied the solution: the main thread never searched
 	}{
 		{"main", IssueChallenge("secret", "198.51.100.7", "/", time.Now().Add(time.Minute)), false},
 		{"no-dataset", "short-challenge", false},
@@ -198,11 +201,63 @@ func TestPowJSSolvesOnEveryPath(t *testing.T) {
 			if tc.mode == "worker-error" || tc.mode == "worker-silent" {
 				require.Contains(t, hooks, "terminate")
 			}
+			if tc.worker {
+				require.EqualValues(t, 0, out["mainSlices"], "main thread searched; worker solution was discarded")
+			} else {
+				require.Greater(t, out["mainSlices"].(float64), 0.0)
+				// Main thread reports progress every slice, ending at the solution.
+				prog := out["progress"].([]any)
+				require.NotEmpty(t, prog)
+				n, _ := strconv.Atoi(sol)
+				require.EqualValues(t, n+1, prog[len(prog)-1])
+			}
 			if tc.mode == "worker-error" {
 				// onerror falls back at once, not after the 1.5s ready watchdog.
 				require.Less(t, out["ms"].(float64), 1000.0)
 			}
 		})
+	}
+}
+
+// The worker posts progress (first after its first 4096-attempt chunk, then at
+// most every 250 ms) and the page forwards it to apxChallengeProgress.
+func TestPowJSWorkerReportsProgress(t *testing.T) {
+	const d = 16
+	ch := ""
+	for i := 0; ; i++ {
+		c := "progress-" + strconv.Itoa(i)
+		if n, _ := strconv.Atoi(SolvePoW(c, d)); n > 4096 {
+			ch = c
+			break
+		}
+	}
+	out := runPowJS(t, map[string]any{"mode": "worker", "challenge": ch, "difficulty": d})
+	require.Equal(t, SolvePoW(ch, d), out["solution"])
+	require.EqualValues(t, 0, out["mainSlices"])
+	prog := out["progress"].([]any)
+	require.NotEmpty(t, prog)
+	require.EqualValues(t, 4096, prog[0])
+}
+
+// A long main-thread solve reports progress once per time slice.
+func TestPowJSMainThreadReportsProgressPerSlice(t *testing.T) {
+	const d = 16
+	ch := ""
+	for i := 0; ; i++ {
+		c := "slices-" + strconv.Itoa(i)
+		if n, _ := strconv.Atoi(SolvePoW(c, d)); n > 250000 {
+			ch = c
+			break
+		}
+	}
+	out := runPowJS(t, map[string]any{"mode": "main", "challenge": ch, "difficulty": d})
+	require.Equal(t, SolvePoW(ch, d), out["solution"])
+	slices := int(out["mainSlices"].(float64))
+	require.GreaterOrEqual(t, slices, 2, "solve should span several 50 ms slices")
+	prog := out["progress"].([]any)
+	require.Len(t, prog, slices)
+	for k := 1; k < len(prog); k++ {
+		require.Greater(t, prog[k].(float64), prog[k-1].(float64))
 	}
 }
 

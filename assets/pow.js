@@ -6,7 +6,18 @@
 //
 // ES5 only (old TV browsers): no crypto.subtle, TextEncoder or Promise. The
 // solve runs in a Blob worker when one starts, else in time-sliced batches on
-// the main thread. Errors go to window.apxChallengeFail(reason).
+// the main thread.
+//
+// Optional page hooks (each called only if it is a function; a throw inside
+// one is swallowed):
+//   window.apxChallengeFail(reason)     unrecoverable error; reason is one of
+//                                       "no-form", "no-difficulty",
+//                                       "exception", "submit-error". A failed
+//                                       worker falls back silently instead.
+//   window.apxChallengeProgress(n)      n = attempts so far; at least once per
+//                                       main-thread slice (<= ~50 ms) and on
+//                                       each worker progress post (<= ~250 ms).
+//   window.apxChallengeDone()           right before form.submit().
 (function () {
   var win = window;
   var done = false;
@@ -14,6 +25,12 @@
   function fail(reason) {
     try {
       if (typeof win.apxChallengeFail === "function") win.apxChallengeFail(reason);
+    } catch (e) {}
+  }
+
+  function progress(n) {
+    try {
+      if (typeof win.apxChallengeProgress === "function") win.apxChallengeProgress(n);
     } catch (e) {}
   }
 
@@ -179,9 +196,10 @@
           var stop = new Date().getTime() + (document.hidden ? 500 : 50);
           do {
             var r = core.search(p, difficulty, i, 1024);
-            if (r >= 0) { submit(String(r)); return; }
+            if (r >= 0) { progress(r + 1); submit(String(r)); return; }
             i += 1024;
           } while (new Date().getTime() < stop);
+          progress(i);
           setTimeout(step, 0);
         } catch (e) {
           fail("exception");
@@ -203,9 +221,12 @@
         "\n  var m = String(e.data), k = m.indexOf('|');" +
         "\n  var d = parseInt(m.slice(0, k), 10), p = c.prepare(m.slice(k + 1));" +
         "\n  self.postMessage('ready');" +
-        "\n  for (var i = 0; ; i += 65536) {" +
-        "\n    var r = c.search(p, d, i, 65536);" +
+        "\n  var last = 0;" +
+        "\n  for (var i = 0; ; i += 4096) {" +
+        "\n    var r = c.search(p, d, i, 4096);" +
         "\n    if (r >= 0) { self.postMessage('s:' + r); return; }" +
+        "\n    var now = new Date().getTime();" +
+        "\n    if (now - last >= 250) { last = now; self.postMessage('p:' + (i + 4096)); }" +
         "\n  }" +
         "\n};";
       var w, url, readyTimer, abandoned = false;
@@ -233,6 +254,7 @@
         if (abandoned) return;
         var m = String(e.data);
         if (m === "ready") { clearTimeout(readyTimer); return; }
+        if (m.slice(0, 2) === "p:") { progress(parseInt(m.slice(2), 10)); return; }
         if (m.slice(0, 2) !== "s:") return;
         var s = m.slice(2);
         // One hash on the main thread guards against a broken worker.
