@@ -1,6 +1,34 @@
-:root { color-scheme: light dark; }
-body { font-family: system-ui, sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; }
-.box { max-width: 28rem; text-align: center; padding: 2rem; }
-.spinner { width: 2rem; height: 2rem; border: 3px solid #8884; border-top-color: #888; border-radius: 50%; animation: spin 1s linear infinite; margin: 1rem auto; }
+:root {
+  color-scheme: light dark;
+  --ground: #f6f6f4;
+  --ink: #1d1d1b;
+  --ink-muted: #5c5c57;
+  --line: #d9d9d4;
+  --button: #1d1d1b;
+  --button-ink: #ffffff;
+  --focus: #2f6fd6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #161615;
+    --ink: #ececea;
+    --ink-muted: #a3a39d;
+    --line: #3a3a37;
+    --button: #ececea;
+    --button-ink: #161615;
+    --focus: #7aa7ee;
+  }
+}
+[hidden] { display: none !important; }
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; background: var(--ground); color: var(--ink); line-height: 1.5; }
+.box { max-width: 28rem; text-align: center; padding: 2rem 1rem; }
+h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 .75rem; }
+p { margin: 0 0 .75rem; }
+.spinner { width: 2rem; height: 2rem; border: 3px solid var(--line); border-top-color: var(--ink-muted); border-radius: 50%; animation: spin 1s linear infinite; margin: 1rem auto; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.muted { color: #888; font-size: .9rem; }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+.muted { color: var(--ink-muted); font-size: .9rem; }
+.button { display: inline-block; min-height: 44px; box-sizing: border-box; padding: .6rem 1.25rem; margin-top: .5rem; border: 1px solid var(--button); border-radius: 6px; background: var(--button); color: var(--button-ink); font: inherit; font-size: 1rem; font-weight: 500; text-decoration: none; cursor: pointer; }
+.button:hover { opacity: .9; }
+.button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.button-secondary { background: transparent; color: var(--ink); border-color: var(--line); }

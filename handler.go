@@ -2,6 +2,7 @@ package apxchallenge
 
 import (
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -60,6 +61,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 
 	if c, err := r.Cookie(CookieName); err == nil && VerifyCookie(h.app.Secret(), c.Value, ip) {
 		setOutcome(r, "passed_recently")
+		clearTriesCookie(w, r) // apx-challenge-failure-states: pass cookie works, reset the loop breaker
 		// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
 		return next.ServeHTTP(w, r)
 	}
@@ -80,7 +82,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 
 	setOutcome(r, "issued")
 	tok := IssueChallenge(h.app.Secret(), ip, safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
-	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath())
+	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath(), r.URL.RequestURI(), defaultChallengeTimeoutMs)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
@@ -96,7 +98,26 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	p, err := VerifyChallenge(h.app.Secret(), challenge, ip)
 	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) {
 		setOutcome(r, "failed")
-		w.WriteHeader(http.StatusForbidden)
+		if !isBrowserFormPost(r) {
+			w.WriteHeader(http.StatusForbidden)
+			return nil
+		}
+		// The token's return path when it still verifies, else the page's
+		// hidden ret field (an expired or IP-mismatched token can't be trusted).
+		ret := safeReturn(r.FormValue("ret"))
+		if err == nil {
+			ret = safeReturn(p.Ret)
+		}
+		st := readTries(r, h.app.Secret())
+		st.countFailure()
+		writeTries(w, h.app.Secret(), st)
+		if st.Failed >= maxVerifyTries {
+			writeGaveUpPage(w, ret, false)
+			return nil
+		}
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Location", ret)
+		w.WriteHeader(http.StatusSeeOther)
 		return nil
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -109,9 +130,60 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		MaxAge:   int(cookieTTL.Seconds()),
 	})
 	setOutcome(r, "passed")
+	st := readTries(r, h.app.Secret())
+	counted := st.countPass(time.Now())
+	writeTries(w, h.app.Secret(), st)
+	if st.Passed >= maxVerifyTries {
+		// Passed repeatedly but never came back with the pass cookie.
+		writeGaveUpPage(w, safeReturn(p.Ret), true)
+		return nil
+	}
+	if !counted {
+		// Another pass in the same round (other tab, Retry, or a loop):
+		// continue after a pause rather than at once, so a loop is slowed.
+		writeContinuePage(w, safeReturn(p.Ret))
+		return nil
+	}
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+// writeContinuePage serves the 200 "Continuing…" page that sends the browser
+// on to ret after continueDelay (meta refresh, plus a link without it).
+func writeContinuePage(w http.ResponseWriter, ret string) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(renderContinuePage(ret, int(continueDelay.Seconds()))))
+}
+
+// writeGaveUpPage serves the explanation page (200) that ends a challenge
+// loop. passedButNotKept selects the copy for a browser that passes the check
+// but never keeps the pass cookie.
+func writeGaveUpPage(w http.ResponseWriter, ret string, passedButNotKept bool) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(renderFailedPage(ret, passedButNotKept)))
+}
+
+// isBrowserFormPost reports whether a verify POST came from a page navigation
+// (the challenge form) rather than a script or API client. Those get a
+// recovery redirect on failure; everything else keeps the bare 403.
+func isBrowserFormPost(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Mode") == "navigate" {
+		return true
+	}
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		return true
+	}
+	if r.Header.Get("Sec-Fetch-Mode") != "" || r.Header.Get("Sec-Fetch-Site") != "" ||
+		r.Header.Get("Sec-Fetch-Dest") != "" || r.Header.Get("Sec-Fetch-User") != "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "application/x-www-form-urlencoded"
 }
 
 func setOutcome(r *http.Request, outcome string) {
@@ -127,15 +199,22 @@ func clientIP(r *http.Request) string {
 }
 
 // safeReturn prevents open-redirects: only same-origin absolute paths. Rejects
-// scheme-relative ("//host"), absolute URLs, and backslash variants ("/\\host")
-// that browsers normalize to "//host". Anything else → "/".
+// scheme-relative ("//host"), absolute URLs, backslash variants ("/\\host")
+// that browsers normalize to "//host", and any control character (browsers
+// strip tab/newline from URLs, so "/\t/host" becomes "//host"). Anything
+// else → "/".
 func safeReturn(ret string) string {
-	if strings.HasPrefix(ret, "/") &&
-		!strings.HasPrefix(ret, "//") &&
-		!strings.HasPrefix(ret, "/\\") {
-		return ret
+	if !strings.HasPrefix(ret, "/") ||
+		strings.HasPrefix(ret, "//") ||
+		strings.HasPrefix(ret, "/\\") {
+		return "/"
 	}
-	return "/"
+	for i := 0; i < len(ret); i++ {
+		if ret[i] < 0x20 || ret[i] == 0x7f {
+			return "/"
+		}
+	}
+	return ret
 }
 
 func isWebSocketOrSSE(r *http.Request) bool {

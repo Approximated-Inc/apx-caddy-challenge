@@ -3,9 +3,11 @@ package apxchallenge
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -119,9 +121,425 @@ func TestVerifyFailureReturns403(t *testing.T) {
 	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
 	r.RemoteAddr = "203.0.113.5:443"
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("Sec-Fetch-Mode", "cors") // a script, not the challenge form
 	w := httptest.NewRecorder()
 	require.NoError(t, h.ServeHTTP(w, withVars(r), nextOK))
 	require.Equal(t, 403, w.Code)
+}
+
+// verifyPost builds a verify POST. browser=true mimics Chromium submitting the
+// challenge form (navigate + text/html Accept).
+func verifyPost(form url.Values, browser bool, cookies ...*http.Cookie) *http.Request {
+	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
+	r.RemoteAddr = "203.0.113.5:443"
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if browser {
+		r.Header.Set("Sec-Fetch-Mode", "navigate")
+		r.Header.Set("Sec-Fetch-Dest", "document")
+		r.Header.Set("Accept", "text/html,application/xhtml+xml")
+	}
+	for _, c := range cookies {
+		r.AddCookie(c)
+	}
+	return withVars(r)
+}
+
+func triesCookie(t *testing.T, w *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range w.Result().Cookies() {
+		if c.Name == triesCookieName {
+			return c
+		}
+	}
+	return nil
+}
+
+// triesOf decodes a tries cookie the handler set.
+func triesOf(t *testing.T, c *http.Cookie) triesState {
+	t.Helper()
+	require.NotNil(t, c)
+	r := httptest.NewRequest("GET", "/", nil)
+	r.AddCookie(c)
+	return readTries(r, "h-secret")
+}
+
+// signedTries builds a tries cookie as the handler would.
+func signedTries(st triesState) *http.Cookie {
+	w := httptest.NewRecorder()
+	writeTries(w, "h-secret", st)
+	c := w.Result().Cookies()[0]
+	return &http.Cookie{Name: c.Name, Value: c.Value}
+}
+
+func expiredForm(ret string) url.Values {
+	tok := IssueChallenge("h-secret", "203.0.113.5", ret, time.Now().Add(-time.Minute))
+	return url.Values{"challenge": {tok}, "solution": {SolvePoW(tok, 8)}, "ret": {ret}}
+}
+
+func TestBrowserVerifyExpiredTokenRedirectsToFreshChallenge(t *testing.T) {
+	h := newHandler()
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, verifyPost(expiredForm("/dashboard?a=1"), true), nextOK))
+	require.Equal(t, 303, w.Code)
+	require.Equal(t, "/dashboard?a=1", w.Result().Header.Get("Location"))
+	require.Equal(t, "private, no-store", w.Result().Header.Get("Cache-Control"))
+	c := triesCookie(t, w)
+	require.NotNil(t, c)
+	require.Equal(t, triesState{Failed: 1}, triesOf(t, c))
+	require.Equal(t, "__Host-apx-challenge-tries", c.Name)
+	require.Empty(t, c.Domain)
+	require.True(t, c.HttpOnly)
+	require.True(t, c.Secure)
+	require.Equal(t, http.SameSiteLaxMode, c.SameSite)
+	require.Equal(t, 1800, c.MaxAge) // covers token TTL + slow solves
+	require.Equal(t, "/", c.Path)
+	for _, ck := range w.Result().Cookies() {
+		require.NotEqual(t, CookieName, ck.Name, "no pass cookie on failure")
+	}
+}
+
+func TestBrowserDetection(t *testing.T) {
+	form := expiredForm("/x")
+	// Accept text/html alone (no Sec-Fetch) is a browser.
+	r := verifyPost(form, false)
+	r.Header.Set("Accept", "text/html")
+	w := httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, r, nextOK))
+	require.Equal(t, 303, w.Code)
+
+	// Plain form POST without any Sec-Fetch headers (older browsers) is a browser.
+	w = httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, verifyPost(form, false), nextOK))
+	require.Equal(t, 303, w.Code)
+}
+
+func TestNonBrowserVerifyFailureKeeps403(t *testing.T) {
+	cases := map[string]func(r *http.Request){
+		"fetch": func(r *http.Request) {
+			r.Header.Set("Sec-Fetch-Mode", "cors")
+			r.Header.Set("Sec-Fetch-Site", "same-origin")
+			r.Header.Set("Accept", "*/*")
+		},
+		"json client": func(r *http.Request) {
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Accept", "application/json")
+		},
+		"no content type": func(r *http.Request) { r.Header.Del("Content-Type") },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := verifyPost(expiredForm("/dashboard"), false)
+			mutate(r)
+			w := httptest.NewRecorder()
+			require.NoError(t, newHandler().ServeHTTP(w, r, nextOK))
+			require.Equal(t, 403, w.Code)
+			require.Empty(t, w.Result().Header.Get("Location"))
+			require.Nil(t, triesCookie(t, w))
+		})
+	}
+}
+
+// failingSolution returns a solution proven not to meet difficulty for tok.
+func failingSolution(tok string, difficulty int) string {
+	for i := 0; ; i++ {
+		s := "bad" + strconv.Itoa(i)
+		if leadingZeroBits(tok, s) < difficulty {
+			return s
+		}
+	}
+}
+
+func TestBrowserVerifyBadSolutionUsesTokenReturnPath(t *testing.T) {
+	// A still-valid token's ret wins over the form field.
+	tok := IssueChallenge("h-secret", "203.0.113.5", "/from-token", timeNowPlus10())
+	form := url.Values{"challenge": {tok}, "solution": {failingSolution(tok, 8)}, "ret": {"/from-form"}}
+	r := verifyPost(form, true)
+	w := httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, r, nextOK))
+	require.Equal(t, 303, w.Code)
+	require.Equal(t, "/from-token", w.Result().Header.Get("Location"))
+	vars := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
+	require.Equal(t, "failed", vars["apx_challenge_outcome"])
+	require.Equal(t, 1, triesOf(t, triesCookie(t, w)).Failed)
+	for _, ck := range w.Result().Cookies() {
+		require.NotEqual(t, CookieName, ck.Name, "no pass cookie on failure")
+	}
+}
+
+func TestBrowserVerifyRetFieldSanitized(t *testing.T) {
+	for _, bad := range []string{"//evil.com", "/\\evil.com", "https://evil.com", "/\t/evil.com", "/\n/evil.com", "", "evil.com"} {
+		form := url.Values{"challenge": {"garbage"}, "solution": {"1"}, "ret": {bad}}
+		w := httptest.NewRecorder()
+		require.NoError(t, newHandler().ServeHTTP(w, verifyPost(form, true), nextOK))
+		require.Equal(t, 303, w.Code, bad)
+		require.Equal(t, "/", w.Result().Header.Get("Location"), bad)
+	}
+}
+
+func TestBrowserVerifyCounterIncrementsThenExplains(t *testing.T) {
+	h := newHandler()
+	var jar []*http.Cookie
+	for i := 1; i <= 2; i++ {
+		w := httptest.NewRecorder()
+		require.NoError(t, h.ServeHTTP(w, verifyPost(expiredForm("/dashboard"), true, jar...), nextOK))
+		require.Equal(t, 303, w.Code, "failure %d", i)
+		c := triesCookie(t, w)
+		require.NotNil(t, c)
+		require.Equal(t, i, triesOf(t, c).Failed)
+		jar = []*http.Cookie{{Name: c.Name, Value: c.Value}}
+	}
+
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, verifyPost(expiredForm("/dashboard"), true, jar...), nextOK))
+	require.Equal(t, 200, w.Code)
+	require.Empty(t, w.Result().Header.Get("Location"))
+	require.Equal(t, "text/html; charset=utf-8", w.Result().Header.Get("Content-Type"))
+	require.Equal(t, "private, no-store", w.Result().Header.Get("Cache-Control"))
+	body := w.Body.String()
+	require.Contains(t, body, "We couldn't confirm your browser")
+	require.Contains(t, body, `href="/dashboard"`)
+	require.Equal(t, 3, triesOf(t, triesCookie(t, w)).Failed)
+	require.Contains(t, body, `data-reason="failed"`)
+
+	// A huge signed count is clamped and can't wrap into more redirects.
+	w = httptest.NewRecorder()
+	big := signedTries(triesState{Failed: math.MaxInt, Passed: math.MaxInt, LastPass: time.Now().Add(-20 * time.Second).Unix()})
+	require.NoError(t, h.ServeHTTP(w, verifyPost(expiredForm("/dashboard"), true, big), nextOK))
+	require.Equal(t, 200, w.Code)
+	w = httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, verifyPost(passForm("/dashboard"), true, big), nextOK))
+	require.Equal(t, 200, w.Code)
+}
+
+// Unsigned, forged or other-secret counters count as zero, so a planted
+// cookie can't push a visitor onto the explanation page.
+func TestTriesCookieRejectsPlantedValues(t *testing.T) {
+	at3 := triesState{Failed: 2, Passed: 2, LastPass: time.Now().Add(-20 * time.Second).Unix()}
+	otherSecret := httptest.NewRecorder()
+	writeTries(otherSecret, "other-secret", at3)
+	valid := signedTries(at3)
+	for name, v := range map[string]string{
+		"unsigned":     "2.2",
+		"garbage":      "garbage",
+		"other secret": otherSecret.Result().Cookies()[0].Value,
+		"tampered":     valid.Value[:len(valid.Value)-2] + "xx",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &http.Cookie{Name: triesCookieName, Value: v}
+			w := httptest.NewRecorder()
+			require.NoError(t, newHandler().ServeHTTP(w, verifyPost(expiredForm("/dashboard"), true, c), nextOK))
+			require.Equal(t, 303, w.Code)
+			require.Equal(t, 1, triesOf(t, triesCookie(t, w)).Failed)
+
+			w = httptest.NewRecorder()
+			require.NoError(t, newHandler().ServeHTTP(w, verifyPost(passForm("/dashboard"), true, c), nextOK))
+			require.Equal(t, 303, w.Code)
+			require.Equal(t, 1, triesOf(t, triesCookie(t, w)).Passed)
+		})
+	}
+	// The same state, validly signed for this client, does trip both pages.
+	w := httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, verifyPost(expiredForm("/dashboard"), true, valid), nextOK))
+	require.Equal(t, 200, w.Code)
+	w = httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, verifyPost(passForm("/dashboard"), true, valid), nextOK))
+	require.Equal(t, 200, w.Code)
+}
+
+// The counter isn't bound to the client prefix: a visitor whose /24 changes
+// between verifies keeps its count.
+func TestTriesCountSurvivesPrefixChange(t *testing.T) {
+	at3 := signedTries(triesState{Failed: 2})
+	r := verifyPost(expiredForm("/dashboard"), true, at3)
+	r.RemoteAddr = "198.51.100.9:443" // another /24 than the one that earned the count
+	w := httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, r, nextOK))
+	require.Equal(t, 200, w.Code)
+	require.Contains(t, w.Body.String(), `data-reason="failed"`)
+	require.Equal(t, 3, triesOf(t, triesCookie(t, w)).Failed)
+}
+
+func passForm(ret string) url.Values {
+	tok := IssueChallenge("h-secret", "203.0.113.5", ret, timeNowPlus10())
+	return url.Values{"challenge": {tok}, "solution": {SolvePoW(tok, 8)}, "ret": {ret}}
+}
+
+func TestVerifySuccessCountsAndKeepsCounter(t *testing.T) {
+	h := newHandler()
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, verifyPost(passForm("/dashboard"), true, signedTries(triesState{Failed: 2})), nextOK))
+	require.Equal(t, 303, w.Code)
+	require.Equal(t, "/dashboard", w.Result().Header.Get("Location"))
+	c := triesCookie(t, w)
+	st := triesOf(t, c)
+	require.Equal(t, 2, st.Failed) // two failures earlier don't block a pass
+	require.Equal(t, 1, st.Passed)
+	require.InDelta(t, time.Now().Unix(), st.LastPass, 2)
+	require.Equal(t, 1800, c.MaxAge)
+}
+
+func TestCountFailureClamps(t *testing.T) {
+	st := triesState{Failed: maxVerifyTries}
+	st.countFailure()
+	require.Equal(t, maxVerifyTries, st.Failed)
+}
+
+func TestCountPassSpacingAndWindow(t *testing.T) {
+	now := time.Unix(time.Now().Unix(), 0) // LastPass has whole-second precision
+	at := func(ago time.Duration, n int) triesState {
+		return triesState{Passed: n, LastPass: now.Add(-ago).Unix()}
+	}
+	cases := []struct {
+		name string
+		in   triesState
+		want int
+		last bool // LastPass moves to now
+	}{
+		{"first pass", triesState{}, 1, true},
+		{"same round: other tab or Retry in flight", at(5*time.Second, 2), 2, false},
+		{"just under spacing", at(passCountSpacing-time.Second, 1), 1, false},
+		{"at spacing", at(passCountSpacing, 1), 2, true},
+		{"loop round", at(20*time.Second, 2), 3, true},
+		{"clamped", at(20*time.Second, 3), 3, true},
+		{"just inside window", at(passCountWindow, 2), 3, true},
+		{"ordinary re-challenge after the window", at(passCountWindow+time.Second, 2), 1, true},
+		{"clock went backwards", at(-time.Minute, 2), 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := tc.in
+			require.Equal(t, tc.last, st.countPass(now), "counted")
+			require.Equal(t, tc.want, st.Passed)
+			if tc.last {
+				require.Equal(t, now.Unix(), st.LastPass)
+			} else {
+				require.Equal(t, tc.in.LastPass, st.LastPass)
+			}
+		})
+	}
+}
+
+// Several tabs (or a Retry) passing within one round-trip don't add up, and
+// every pass after the first in that round gets the "Continuing…" page (with
+// the pass cookie) instead of an immediate 303, which slows a loop down.
+func TestPassesInOneRoundCountOnceAndContinueSlowly(t *testing.T) {
+	h := newHandler()
+	jar := []*http.Cookie{}
+	for i := 0; i < 5; i++ {
+		r := verifyPost(passForm("/dashboard?a=1&b=2"), true, jar...)
+		w := httptest.NewRecorder()
+		require.NoError(t, h.ServeHTTP(w, r, nextOK))
+		res := w.Result()
+		var names []string
+		for _, ck := range res.Cookies() {
+			names = append(names, ck.Name)
+		}
+		require.Contains(t, names, CookieName, "pass %d still issues the pass cookie", i)
+		vars := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
+		require.Equal(t, "passed", vars["apx_challenge_outcome"])
+		c := triesCookie(t, w)
+		require.Equal(t, 1, triesOf(t, c).Passed)
+		jar = []*http.Cookie{{Name: c.Name, Value: c.Value}}
+		if i == 0 {
+			require.Equal(t, 303, w.Code)
+			require.Equal(t, "/dashboard?a=1&b=2", res.Header.Get("Location"))
+			continue
+		}
+		require.Equal(t, 200, w.Code, "pass %d", i)
+		require.Empty(t, res.Header.Get("Location"))
+		require.Equal(t, "private, no-store", res.Header.Get("Cache-Control"))
+		require.Equal(t, "text/html; charset=utf-8", res.Header.Get("Content-Type"))
+		body := w.Body.String()
+		require.Contains(t, body, `id="apx-continue"`)
+		require.Contains(t, body, `<meta http-equiv="refresh" content="5;url=/dashboard?a=1&amp;b=2">`)
+		require.Contains(t, body, `href="/dashboard?a=1&amp;b=2"`)
+		require.NotContains(t, body, "<script")
+	}
+}
+
+func TestContinuePageSanitizesAndEscapesReturn(t *testing.T) {
+	cases := map[string]string{
+		`/a?q="><script>x</script>`: `/a?q=&#34;&gt;&lt;script&gt;x&lt;/script&gt;`,
+		"//evil.com":                "/",
+		"/\\evil.com":               "/",
+		"https://evil.com":          "/",
+		"/\t/evil.com":              "/",
+	}
+	for ret, want := range cases {
+		tok := IssueChallenge("h-secret", "203.0.113.5", ret, timeNowPlus10())
+		form := url.Values{"challenge": {tok}, "solution": {SolvePoW(tok, 8)}}
+		inRound := signedTries(triesState{Passed: 1, LastPass: time.Now().Unix()})
+		w := httptest.NewRecorder()
+		require.NoError(t, newHandler().ServeHTTP(w, verifyPost(form, true, inRound), nextOK))
+		require.Equal(t, 200, w.Code, ret)
+		body := w.Body.String()
+		require.Contains(t, body, `content="5;url=`+want+`"`, ret)
+		require.Contains(t, body, `href="`+want+`"`, ret)
+		require.NotContains(t, body, "<script>x", ret)
+		require.NotContains(t, body, "evil.com", ret)
+	}
+}
+
+// A browser that passes but never sends the pass cookie back (cookies dropped,
+// cross-site frame, /24 change between GET and POST) must not loop forever.
+func TestVerifySuccessLoopEndsOnExplanationPage(t *testing.T) {
+	h := newHandler()
+	looping := signedTries(triesState{Passed: 2, LastPass: time.Now().Add(-20 * time.Second).Unix()})
+	r := verifyPost(passForm("/dashboard"), true, looping)
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextOK))
+	require.Equal(t, 200, w.Code)
+	require.Empty(t, w.Result().Header.Get("Location"))
+	require.Equal(t, "private, no-store", w.Result().Header.Get("Cache-Control"))
+	require.Contains(t, w.Body.String(), `data-reason="not_kept"`)
+	require.Contains(t, w.Body.String(), `href="/dashboard"`)
+	var names []string
+	for _, ck := range w.Result().Cookies() {
+		names = append(names, ck.Name)
+	}
+	require.Contains(t, names, CookieName, "the pass cookie is still issued")
+	require.Equal(t, 3, triesOf(t, triesCookie(t, w)).Passed)
+	vars := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
+	require.Equal(t, "passed", vars["apx_challenge_outcome"])
+}
+
+func TestValidPassCookieClearsCounter(t *testing.T) {
+	h := newHandler()
+	pass := &http.Cookie{Name: CookieName, Value: IssueCookie("h-secret", "203.0.113.5", timeNowPlus10())}
+
+	r := browserReq("/dashboard")
+	r.AddCookie(pass)
+	r.AddCookie(signedTries(triesState{Failed: 1, Passed: 2}))
+	w := httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextOK))
+	require.Equal(t, "UPSTREAM", w.Body.String())
+	c := triesCookie(t, w)
+	require.NotNil(t, c)
+	require.Equal(t, "", c.Value)
+	require.Less(t, c.MaxAge, 0)
+
+	// No counter on the request → no clearing header.
+	r = browserReq("/dashboard")
+	r.AddCookie(pass)
+	w = httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextOK))
+	require.Nil(t, triesCookie(t, w))
+
+	// An invalid pass cookie doesn't clear it: the visitor is challenged again.
+	r = browserReq("/dashboard")
+	r.AddCookie(&http.Cookie{Name: CookieName, Value: "forged"})
+	r.AddCookie(signedTries(triesState{Passed: 2}))
+	w = httptest.NewRecorder()
+	require.NoError(t, h.ServeHTTP(w, r, nextOK))
+	require.Contains(t, w.Body.String(), "apx-challenge")
+	require.Nil(t, triesCookie(t, w))
+}
+
+func TestChallengePageCarriesRet(t *testing.T) {
+	w := httptest.NewRecorder()
+	require.NoError(t, newHandler().ServeHTTP(w, browserReq("/dashboard?x=1"), nextOK))
+	require.Contains(t, w.Body.String(), `name="ret" value="/dashboard?x=1"`)
+	require.Contains(t, w.Body.String(), "var TIMEOUT_MS = 20000;")
 }
 
 func TestSafeReturn(t *testing.T) {
@@ -132,6 +550,9 @@ func TestSafeReturn(t *testing.T) {
 	require.Equal(t, "/", safeReturn("https://evil.com"))
 	require.Equal(t, "/", safeReturn("javascript:alert(1)"))
 	require.Equal(t, "/", safeReturn(""))
+	require.Equal(t, "/", safeReturn("/\t/evil.com")) // browsers strip tab → "//evil.com"
+	require.Equal(t, "/", safeReturn("/\n/evil.com"))
+	require.Equal(t, "/", safeReturn("/\x7f"))
 }
 
 func TestVerifyRedirectIsSanitized(t *testing.T) {
