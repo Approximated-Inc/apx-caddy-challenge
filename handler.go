@@ -113,9 +113,8 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
-	// The cap counts from the challenge's issue (tokens are minted with
-	// exp = issue + challengeTokenTTL), so replaying a token can't reset it.
-	iat := time.Unix(p.Exp, 0).Add(-challengeTokenTTL)
+	// The cap counts from the challenge's issue, so replaying a token can't reset it.
+	iat := p.IssuedAt(challengeTokenTTL)
 	exp := pol.InitialExp(iat, now)
 	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), iat, exp), exp, now)
 	setOutcome(r, "passed")

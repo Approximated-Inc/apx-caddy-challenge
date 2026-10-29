@@ -85,7 +85,7 @@ func TestDefaultPolicyCookieGolden(t *testing.T) {
 
 func TestDefaultPolicyChallengeGolden(t *testing.T) {
 	exp := time.Unix(goldenExpUnix, 0)
-	require.Equal(t, masterChallengeV4, issueChallengeNonce(goldenSecret, DefaultPassPolicy(), "203.0.113.5", "Mozilla/5.0", "/dash?x=1", exp, "AAAAAAAAAAAAAAAA"))
+	require.Equal(t, masterChallengeV4, issueChallengeNonce(goldenSecret, DefaultPassPolicy(), "203.0.113.5", "Mozilla/5.0", "/dash?x=1", time.Now(), exp, "AAAAAAAAAAAAAAAA"))
 
 	p, err := VerifyChallenge(goldenSecret, masterChallengeV4, "203.0.113.9")
 	require.NoError(t, err)
@@ -500,16 +500,18 @@ func TestHandleVerifyIssuesPolicyCookie(t *testing.T) {
 	pol.IdleTTL = 900 * time.Second
 	pol.BindUserAgent = true
 	h := policyHandler(pol)
-	// Token issued 2 minutes before the solve is posted.
-	tokExp := time.Now().Add(challengeTokenTTL - 2*time.Minute)
-	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA-1", "/x", tokExp)
+	// Token issued 2 minutes before the solve is posted, with an exp that is
+	// NOT issue + challengeTokenTTL, so only the token's explicit issued-at
+	// gives the right answer.
+	issued := time.Now().Add(-2 * time.Minute)
+	tok := issueChallengeNonce("h-secret", pol, "203.0.113.5", "UA-1", "/x", issued, time.Now().Add(time.Minute), "nonce-explicit-iat")
 
 	w := postVerify(t, h, tok, "203.0.113.5", "UA-1")
 	require.Equal(t, http.StatusSeeOther, w.Code)
 	c := passCookieHeader(t, w)
 	require.NotNil(t, c)
 	require.InDelta(t, 900, c.MaxAge, 1)
-	require.Equal(t, float64(tokExp.Unix()-int64(challengeTokenTTL/time.Second)), decodePayload(t, c.Value)["i"], "issued-at is the challenge's issue time")
+	require.Equal(t, float64(issued.Unix()), decodePayload(t, c.Value)["i"], "issued-at is the challenge's issue time")
 	require.True(t, c.HttpOnly)
 	require.True(t, c.Secure)
 	require.Equal(t, http.SameSiteLaxMode, c.SameSite)
@@ -632,4 +634,50 @@ func TestHandleVerifyDefaultCookieShape(t *testing.T) {
 	require.Len(t, p, 2, "default cookie payload is exactly {e, p}")
 	require.Equal(t, "203.0.113.0/24", p["p"])
 	require.True(t, legacyVerifyCookie("h-secret", c.Value, "203.0.113.5"))
+}
+
+func TestChallengeTokenIssuedAt(t *testing.T) {
+	issued := time.Unix(1_000_000, 0)
+	exp := issued.Add(time.Minute)
+
+	tok := issueChallengeNonce(secret, rollingPolicy(), "203.0.113.5", "", "/x", issued, exp, "n1")
+	require.Equal(t, float64(issued.Unix()), decodePayload(t, tok)["i"])
+
+	// Default policy: no "i" (byte-compatible with master); falls back to exp - ttl.
+	def := issueChallengeNonce(secret, DefaultPassPolicy(), "203.0.113.5", "", "/x", issued, exp, "n2")
+	require.NotContains(t, decodePayload(t, def), "i")
+	require.Equal(t, exp.Add(-challengeTokenTTL), ChallengePayload{Exp: exp.Unix()}.IssuedAt(challengeTokenTTL))
+	require.Equal(t, issued, ChallengePayload{Exp: exp.Unix(), Iat: issued.Unix()}.IssuedAt(challengeTokenTTL))
+}
+
+func TestHandleVerifyFallsBackToDerivedIssuedAt(t *testing.T) {
+	// A token without "i" (minted by an old machine or under the default
+	// policy) verifying under a rolling /24 policy: issued-at = exp - ttl.
+	h := policyHandler(rollingPolicy())
+	tokExp := time.Now().Add(challengeTokenTTL - 2*time.Minute)
+	tok := IssueChallenge("h-secret", "203.0.113.5", "/x", tokExp)
+	w := postVerify(t, h, tok, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusSeeOther, w.Code)
+	c := passCookieHeader(t, w)
+	require.NotNil(t, c)
+	require.Equal(t, float64(tokExp.Unix()-int64(challengeTokenTTL/time.Second)), decodePayload(t, c.Value)["i"])
+}
+
+func TestSolvedChallengeStaysSpentAcrossReprovision(t *testing.T) {
+	cfg := func() *ChallengeApp {
+		a := &ChallengeApp{SecretCfg: "reload-secret", DifficultyCfg: 8, PassIPv4PrefixCfg: 32}
+		require.NoError(t, a.Provision(caddy.Context{}))
+		return a
+	}
+	a1 := cfg()
+	tok := IssuePassChallenge("reload-secret", a1.PassPolicy(), "203.0.113.5", "UA", "/x", time.Now().Add(challengeTokenTTL))
+	w := postVerify(t, &ChallengeHandler{app: a1}, tok, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusSeeOther, w.Code)
+	require.NotNil(t, passCookieHeader(t, w))
+
+	// A config reload re-provisions the app; the solve must stay spent.
+	a2 := cfg()
+	w = postVerify(t, &ChallengeHandler{app: a2}, tok, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Nil(t, passCookieHeader(t, w))
 }

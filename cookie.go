@@ -30,6 +30,17 @@ type ChallengePayload struct {
 	Ret    string `json:"r"`
 	// UA is the User-Agent hash, present only under pass_bind_user_agent.
 	UA string `json:"u,omitempty"`
+	// Iat is the issue time, present only under a non-default pass policy.
+	Iat int64 `json:"i,omitempty"`
+}
+
+// IssuedAt is the token's issue time: Iat when present, else exp - ttl (every
+// token is minted with exp = issue + ttl).
+func (p ChallengePayload) IssuedAt(ttl time.Duration) time.Time {
+	if p.Iat != 0 {
+		return time.Unix(p.Iat, 0)
+	}
+	return time.Unix(p.Exp, 0).Add(-ttl)
 }
 
 // cookiePayload is the signed pass-cookie body. Iat and UA are omitted unless
@@ -64,8 +75,8 @@ func DefaultPassPolicy() PassPolicy {
 func (pol PassPolicy) Rolling() bool { return pol.MaxTTL > pol.IdleTTL }
 
 // PassCookie is a verified pass cookie's lifetime. IssuedAt is zero when the
-// cookie carries no issued-at (minted while rolling was off); such a cookie is
-// never renewed.
+// cookie carries no issued-at (minted while rolling was off); Renewal then caps
+// it at year 1 + max, which is always before its exp, so it is never renewed.
 type PassCookie struct {
 	Exp      time.Time
 	IssuedAt time.Time
@@ -85,10 +96,10 @@ func (pol PassPolicy) InitialExp(issuedAt, now time.Time) time.Time {
 
 // Renewal returns the new expiry for a valid cookie when rolling renewal is on
 // and less than half the idle TTL remains: min(now + idle, issued_at + max).
-// False when renewal is off, not yet due, the cookie has no issued-at, or the
-// absolute cap is reached.
+// False when renewal is off, not yet due, or the absolute cap is reached (a
+// zero IssuedAt counts as reached).
 func (pol PassPolicy) Renewal(c PassCookie, now time.Time) (time.Time, bool) {
-	if !pol.Rolling() || c.IssuedAt.IsZero() || c.Exp.Sub(now) >= pol.IdleTTL/2 {
+	if !pol.Rolling() || c.Exp.Sub(now) >= pol.IdleTTL/2 {
 		return time.Time{}, false
 	}
 	exp := pol.InitialExp(c.IssuedAt, now)
@@ -181,12 +192,15 @@ func VerifyChallenge(secret, token, ip string) (ChallengePayload, error) {
 func IssuePassChallenge(secret string, pol PassPolicy, ip, ua, ret string, exp time.Time) string {
 	nb := make([]byte, 12)
 	_, _ = rand.Read(nb)
-	return issueChallengeNonce(secret, pol, ip, ua, ret, exp, base64.RawURLEncoding.EncodeToString(nb))
+	return issueChallengeNonce(secret, pol, ip, ua, ret, time.Now(), exp, base64.RawURLEncoding.EncodeToString(nb))
 }
 
-func issueChallengeNonce(secret string, pol PassPolicy, ip, ua, ret string, exp time.Time, nonce string) string {
+func issueChallengeNonce(secret string, pol PassPolicy, ip, ua, ret string, now, exp time.Time, nonce string) string {
 	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	p := ChallengePayload{Exp: exp.Unix(), Nonce: nonce, Prefix: pref, Ret: ret}
+	if pol != DefaultPassPolicy() {
+		p.Iat = now.Unix()
+	}
 	if pol.BindUserAgent {
 		p.UA = uaHash(ua)
 	}

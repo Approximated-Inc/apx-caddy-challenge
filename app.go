@@ -97,6 +97,13 @@ type ChallengeApp struct {
 // single-use — cluster-wide uniqueness is not attempted.
 const defaultReplayLRUSize = 65536
 
+// processReplayLRU is the seen-nonce set every ChallengeApp shares. It lives
+// at package level so a config reload (which re-provisions the app) does not
+// forget which tokens and solved challenges were already used. Nonces are
+// random and only recorded after HMAC verification, so one set is safe across
+// secrets.
+var processReplayLRU = NewNonceLRU(defaultReplayLRUSize)
+
 func (*ChallengeApp) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "apx_challenge",
@@ -137,7 +144,7 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.verifyBodyCap = a.VerifyBodyCapBytesCfg; a.verifyBodyCap <= 0 {
 		a.verifyBodyCap = 1 << 20
 	}
-	a.replayLRU = NewNonceLRU(defaultReplayLRUSize)
+	a.replayLRU = processReplayLRU
 
 	pol, err := buildPassPolicy(a.PassIdleTTLSecondsCfg, a.PassMaxTTLSecondsCfg,
 		a.PassIPv4PrefixCfg, a.PassIPv6PrefixCfg, a.PassBindUserAgentCfg)
