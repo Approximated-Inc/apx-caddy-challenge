@@ -5,18 +5,171 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Checking your browser…</title>
 <style>{{CSS}}</style>
+<noscript><style>#apx-checking { display: none; }</style></noscript>
 </head>
 <body>
-<div class="box">
+<main class="box">
+<div id="apx-checking" role="status">
 <h1>Checking your browser…</h1>
 <div class="spinner" aria-hidden="true"></div>
-<p class="muted">This automated check verifies you're not a bot. It runs once and takes a moment.</p>
+<p class="muted" id="apx-intro">This automated check verifies you're not a bot. It runs once and takes a moment.</p>
+<p class="muted" id="apx-verifying" hidden>Verifying…</p>
+<div id="apx-slow" hidden>
+<p class="muted">Still checking… this can take a minute on slower devices.</p>
+<p><button type="button" class="button button-secondary" data-apx-retry>Retry</button></p>
+</div>
+</div>
+<div id="apx-failed" role="alert" hidden>
+<h1>This check didn't finish in your browser.</h1>
+<p class="muted">It can stop on slow devices, on unstable connections, or when an extension blocks scripts. Trying again usually works.</p>
+<p><button type="button" class="button" id="apx-retry" data-apx-retry>Retry</button></p>
+<!-- apx-fallback-slot: reserved for a future human-verification fallback. -->
+<div id="apx-fallback-slot"></div>
+</div>
+<div id="apx-nocookies" role="alert" hidden>
+<h1>This check needs cookies.</h1>
+<p class="muted">Your browser isn't keeping cookies for this site, so it can't remember that you passed. Allow cookies for this site, or open it directly if it's shown inside another site, then try again.</p>
+<p><button type="button" class="button" data-apx-retry>Retry</button></p>
+</div>
+<noscript>
+<div id="apx-noscript">
+<h1>This check didn't finish in your browser.</h1>
+<p class="muted">This site needs JavaScript to check your browser. Turn JavaScript on for this site, then try again.</p>
+<p><a class="button" href="{{RET}}">Try again</a></p>
+</div>
+</noscript>
 <form id="apx-challenge" method="POST" action="{{VERIFY_PATH}}" data-difficulty="{{DIFFICULTY}}">
 <input type="hidden" name="challenge" value="{{CHALLENGE}}">
 <input type="hidden" name="solution" value="">
+<input type="hidden" name="ret" value="{{RET}}">
 </form>
-<noscript><p>JavaScript is required to continue.</p></noscript>
-</div>
+</main>
+<script>
+// Failure UI (ES5). The solver calls apxChallengeProgress(attempts) while it
+// works, apxChallengeDone() once it has a solution and apxChallengeFail(reason)
+// on error. After TIMEOUT_MS the page says "Still checking" while progress keeps
+// arriving and shows the failure panel only once progress stalls, so it never
+// claims failure while the solver is still running.
+(function () {
+  var TIMEOUT_MS = {{TIMEOUT_MS}};
+  var STALL_MS = 10000;
+  function now() { return new Date().getTime(); }
+  function byId(id) { return document.getElementById(id); }
+  // Attribute plus inline style: some engines don't reflect the hidden property.
+  function show(el) { if (el) { el.removeAttribute("hidden"); el.style.display = "block"; } }
+  function hide(el) { if (el) { el.setAttribute("hidden", "hidden"); el.style.display = "none"; } }
+
+  var start = now();
+  var lastProgress = start;
+  var progressSeen = false;
+  var done = false;
+  var slow = false;
+  var failReason = null;
+  var failPanel = null;
+  // Reasons a later progress report undoes: the solver turned out to be alive.
+  var soft = { timeout: 1, stalled: 1, error: 1 };
+
+  function setRetryDisabled(off) {
+    var rs = document.querySelectorAll ? document.querySelectorAll("[data-apx-retry]") : [];
+    for (var i = 0; i < rs.length; i++) {
+      rs[i].disabled = off;
+      if (off) rs[i].setAttribute("disabled", "disabled"); else rs[i].removeAttribute("disabled");
+    }
+  }
+  function fail(reason, panelId) {
+    if (failReason !== null) return;
+    failReason = String(reason || "error");
+    setRetryDisabled(false);
+    failPanel = byId(panelId || "apx-failed");
+    if (!failPanel) return;
+    hide(byId("apx-checking"));
+    failPanel.setAttribute("data-reason", failReason);
+    show(failPanel);
+    var btn = failPanel.getElementsByTagName("button")[0];
+    if (btn && btn.focus) btn.focus();
+  }
+  function showSlow() {
+    if (slow) return;
+    slow = true;
+    hide(byId("apx-intro"));
+    show(byId("apx-slow"));
+  }
+
+  window.apxChallengeFail = function (reason) { fail(reason || "error"); };
+  // Solved: the form is being submitted. Replace any stall/timeout panel with
+  // a neutral "Verifying…" state and disable Retry for the round-trip.
+  window.apxChallengeDone = function () {
+    done = true;
+    if (failPanel) hide(failPanel);
+    failReason = null;
+    failPanel = null;
+    hide(byId("apx-intro"));
+    hide(byId("apx-slow"));
+    show(byId("apx-checking"));
+    show(byId("apx-verifying"));
+    setRetryDisabled(true);
+  };
+  window.apxChallengeProgress = function () {
+    lastProgress = now();
+    progressSeen = true;
+    if (failReason !== null && soft[failReason]) {
+      hide(failPanel);
+      failReason = null;
+      failPanel = null;
+      show(byId("apx-checking"));
+    }
+  };
+
+  var retries = document.querySelectorAll ? document.querySelectorAll("[data-apx-retry]") : [];
+  for (var i = 0; i < retries.length; i++) {
+    retries[i].addEventListener("click", function () {
+      if (this.getAttribute("disabled") !== null) return;
+      location.reload();
+    });
+  }
+
+  // The pass cookie is Secure + SameSite=Lax; if a cookie with the same
+  // attributes doesn't stick (cookies blocked, a cross-site frame, plain http)
+  // a solve can never pass, so say so instead of looping. Removing the form
+  // stops the solver before it spends any work.
+  function cookiesWork() {
+    try {
+      if (navigator.cookieEnabled === false) return false;
+      var probe = "apx-challenge-probe=1";
+      document.cookie = probe + "; path=/; SameSite=Lax; Secure";
+      var ok = document.cookie.indexOf(probe) !== -1;
+      document.cookie = "apx-challenge-probe=; path=/; SameSite=Lax; Secure; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+  if (!cookiesWork()) {
+    fail("cookies", "apx-nocookies");
+    var form = byId("apx-challenge");
+    if (form && form.parentNode) form.parentNode.removeChild(form);
+    return;
+  }
+
+  var timer = setInterval(function () {
+    if (done) { clearInterval(timer); return; }
+    if (failReason !== null || document.hidden) return;
+    var t = now();
+    if (t - start < TIMEOUT_MS) return;
+    if (t - lastProgress > STALL_MS) {
+      fail(progressSeen ? "stalled" : "timeout");
+    } else {
+      showSlow();
+    }
+  }, 1000);
+  // Background tabs throttle timers and the solver alike; don't count that.
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) lastProgress = now();
+  });
+  window.addEventListener("error", function () { if (!done) fail("error"); });
+  window.addEventListener("unhandledrejection", function () { if (!done) fail("error"); });
+})();
+</script>
 <script>{{JS}}</script>
 </body>
 </html>
