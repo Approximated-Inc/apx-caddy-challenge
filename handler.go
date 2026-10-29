@@ -2,8 +2,10 @@ package apxchallenge
 
 import (
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +19,13 @@ const (
 	cookieTTL         = 10 * time.Minute
 	challengeTokenTTL = 5 * time.Minute
 	outcomeVarKey     = "apx_challenge_outcome"
+
+	// triesCookieName counts recent failed verifies from a browser so a
+	// failing check can't redirect-loop: at maxVerifyTries the visitor gets an
+	// explanation page instead of another challenge.
+	triesCookieName = "apx-challenge-tries"
+	triesCookieTTL  = 5 * time.Minute
+	maxVerifyTries  = 3
 )
 
 // ChallengeHandler serves the PoW challenge / verifies solutions. Invoked by the
@@ -79,8 +88,9 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	setOutcome(r, "issued")
-	tok := IssueChallenge(h.app.Secret(), ip, safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
-	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath())
+	ret := safeReturn(r.URL.RequestURI())
+	tok := IssueChallenge(h.app.Secret(), ip, ret, time.Now().Add(challengeTokenTTL))
+	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath(), ret, defaultChallengeTimeoutMs)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
@@ -96,7 +106,17 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	p, err := VerifyChallenge(h.app.Secret(), challenge, ip)
 	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) {
 		setOutcome(r, "failed")
-		w.WriteHeader(http.StatusForbidden)
+		if !isBrowserFormPost(r) {
+			w.WriteHeader(http.StatusForbidden)
+			return nil
+		}
+		// The token's return path when it still verifies, else the page's
+		// hidden ret field (an expired or IP-mismatched token can't be trusted).
+		ret := safeReturn(r.FormValue("ret"))
+		if err == nil {
+			ret = safeReturn(p.Ret)
+		}
+		recoverFailedVerify(w, r, ret)
 		return nil
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -109,9 +129,87 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		MaxAge:   int(cookieTTL.Seconds()),
 	})
 	setOutcome(r, "passed")
+	clearTriesCookie(w, r)
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+// recoverFailedVerify sends a browser whose verify failed back to a fresh
+// challenge at ret (303), counting the failure in a short-lived cookie. On the
+// maxVerifyTries-th failure in a row it serves an explanation page instead, so
+// a check that can't pass never loops.
+func recoverFailedVerify(w http.ResponseWriter, r *http.Request, ret string) {
+	tries := verifyTries(r) + 1
+	http.SetCookie(w, &http.Cookie{
+		Name:     triesCookieName,
+		Value:    strconv.Itoa(tries),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(triesCookieTTL.Seconds()),
+	})
+	w.Header().Set("Cache-Control", "private, no-store")
+	if tries >= maxVerifyTries {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(renderFailedPage(ret)))
+		return
+	}
+	w.Header().Set("Location", ret)
+	w.WriteHeader(http.StatusSeeOther)
+}
+
+// verifyTries reads the failure counter; missing or malformed counts as 0.
+func verifyTries(r *http.Request) int {
+	c, err := r.Cookie(triesCookieName)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(c.Value)
+	if err != nil || n < 0 {
+		return 0
+	}
+	if n > maxVerifyTries {
+		return maxVerifyTries
+	}
+	return n
+}
+
+// clearTriesCookie expires the failure counter after a successful verify.
+// Only sent when the request carried one.
+func clearTriesCookie(w http.ResponseWriter, r *http.Request) {
+	if _, err := r.Cookie(triesCookieName); err != nil {
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     triesCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+// isBrowserFormPost reports whether a verify POST came from a page navigation
+// (the challenge form) rather than a script or API client. Those get a
+// recovery redirect on failure; everything else keeps the bare 403.
+func isBrowserFormPost(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Mode") == "navigate" {
+		return true
+	}
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
+		return true
+	}
+	if r.Header.Get("Sec-Fetch-Mode") != "" || r.Header.Get("Sec-Fetch-Site") != "" ||
+		r.Header.Get("Sec-Fetch-Dest") != "" || r.Header.Get("Sec-Fetch-User") != "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "application/x-www-form-urlencoded"
 }
 
 func setOutcome(r *http.Request, outcome string) {
@@ -127,15 +225,22 @@ func clientIP(r *http.Request) string {
 }
 
 // safeReturn prevents open-redirects: only same-origin absolute paths. Rejects
-// scheme-relative ("//host"), absolute URLs, and backslash variants ("/\\host")
-// that browsers normalize to "//host". Anything else → "/".
+// scheme-relative ("//host"), absolute URLs, backslash variants ("/\\host")
+// that browsers normalize to "//host", and any control character (browsers
+// strip tab/newline from URLs, so "/\t/host" becomes "//host"). Anything
+// else → "/".
 func safeReturn(ret string) string {
-	if strings.HasPrefix(ret, "/") &&
-		!strings.HasPrefix(ret, "//") &&
-		!strings.HasPrefix(ret, "/\\") {
-		return ret
+	if !strings.HasPrefix(ret, "/") ||
+		strings.HasPrefix(ret, "//") ||
+		strings.HasPrefix(ret, "/\\") {
+		return "/"
 	}
-	return "/"
+	for i := 0; i < len(ret); i++ {
+		if ret[i] < 0x20 || ret[i] == 0x7f {
+			return "/"
+		}
+	}
+	return ret
 }
 
 func isWebSocketOrSSE(r *http.Request) bool {

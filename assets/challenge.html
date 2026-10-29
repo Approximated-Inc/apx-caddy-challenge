@@ -5,18 +5,71 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Checking your browser…</title>
 <style>{{CSS}}</style>
+<noscript><style>#apx-checking { display: none; }</style></noscript>
 </head>
 <body>
-<div class="box">
+<main class="box">
+<div id="apx-checking">
 <h1>Checking your browser…</h1>
 <div class="spinner" aria-hidden="true"></div>
 <p class="muted">This automated check verifies you're not a bot. It runs once and takes a moment.</p>
+</div>
+<div id="apx-failed" role="alert" hidden>
+<h1>This check didn't finish in your browser.</h1>
+<p class="muted">It can stop on slow devices, on unstable connections, or when an extension blocks scripts. Trying again usually works.</p>
+<p><button type="button" class="button" id="apx-retry">Retry</button></p>
+<!-- apx-fallback-slot: reserved for a future human-verification fallback. -->
+<div id="apx-fallback-slot"></div>
+</div>
+<noscript>
+<div id="apx-noscript">
+<h1>This check didn't finish in your browser.</h1>
+<p class="muted">This site needs JavaScript to check your browser. Turn JavaScript on for this site, then try again.</p>
+<p><a class="button" href="{{RET}}">Try again</a></p>
+</div>
+</noscript>
 <form id="apx-challenge" method="POST" action="{{VERIFY_PATH}}" data-difficulty="{{DIFFICULTY}}">
 <input type="hidden" name="challenge" value="{{CHALLENGE}}">
 <input type="hidden" name="solution" value="">
+<input type="hidden" name="ret" value="{{RET}}">
 </form>
-<noscript><p>JavaScript is required to continue.</p></noscript>
-</div>
+</main>
+<script>
+// Failure UI (ES5). The solver calls apxChallengeDone() once it has a
+// solution and apxChallengeFail(reason) on error; uncaught errors and a
+// timeout also show the failure panel so the spinner never runs forever.
+(function () {
+  var done = false;
+  var shown = false;
+  var timer = null;
+  function fail(reason) {
+    if (shown) return;
+    shown = true;
+    if (timer !== null) clearTimeout(timer);
+    var checking = document.getElementById("apx-checking");
+    var panel = document.getElementById("apx-failed");
+    if (!panel) return;
+    if (checking) checking.hidden = true;
+    panel.setAttribute("data-reason", String(reason || "error"));
+    panel.hidden = false;
+    var retry = document.getElementById("apx-retry");
+    if (retry) retry.focus();
+  }
+  window.apxChallengeFail = fail;
+  window.apxChallengeDone = function () {
+    done = true;
+    if (timer !== null) clearTimeout(timer);
+  };
+  timer = setTimeout(function () {
+    if (!done) fail("timeout");
+  }, {{TIMEOUT_MS}});
+  window.addEventListener("error", function () { if (!done) fail("error"); });
+  window.addEventListener("unhandledrejection", function () { if (!done) fail("error"); });
+  document.getElementById("apx-retry").addEventListener("click", function () {
+    location.reload();
+  });
+})();
+</script>
 <script>{{JS}}</script>
 </body>
 </html>
