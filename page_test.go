@@ -12,7 +12,7 @@ func TestRenderPageInlinesAssetsAndValues(t *testing.T) {
 	require.Contains(t, html, "TOKEN123")                // challenge token injected
 	require.Contains(t, html, "17")                      // difficulty injected
 	require.Contains(t, html, "/__apx_challenge/verify") // verify path injected
-	require.Contains(t, html, "async function solve")    // pow.js inlined
+	require.Contains(t, html, "function powCore()")      // pow.js inlined
 	require.Contains(t, html, "<style>")                 // css inlined
 	require.NotContains(t, html, "{{")                   // no unreplaced placeholders
 	require.Contains(t, html, `method="POST"`)           // native form POST
