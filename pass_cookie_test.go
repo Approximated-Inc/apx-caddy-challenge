@@ -521,12 +521,23 @@ func TestHandleVerifyIssuesPolicyCookie(t *testing.T) {
 	require.True(t, ok)
 }
 
+// postVerify posts a solved challenge as a non-browser client
+// (Sec-Fetch-Mode: cors), so a failed verify is a plain 403.
 func postVerify(t *testing.T, h *ChallengeHandler, tok, ip, ua string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postVerifyWith(t, h, tok, ip, ua, map[string]string{"Sec-Fetch-Mode": "cors"})
+}
+
+// postVerifyWith posts a solved challenge with extra request headers.
+func postVerifyWith(t *testing.T, h *ChallengeHandler, tok, ip, ua string, hdr map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	form := url.Values{"challenge": {tok}, "solution": {SolvePoW(tok, 8)}}
 	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Set("User-Agent", ua)
+	for k, v := range hdr {
+		r.Header.Set(k, v)
+	}
 	r.RemoteAddr = ip + ":443"
 	r = withVars(r)
 	w := httptest.NewRecorder()
@@ -570,6 +581,13 @@ func TestOneSolveMintsOneCookieUnderPolicy(t *testing.T) {
 		w := postVerify(t, h, tok, c.ip, c.ua)
 		require.Equal(t, http.StatusForbidden, w.Code, "%+v", c)
 		require.Nil(t, passCookieHeader(t, w), "%+v", c)
+
+		// The invariant, whatever status a browser-style form post gets: no
+		// second pass cookie is minted from the same solve.
+		w = postVerifyWith(t, h, tok, c.ip, c.ua, nil)
+		require.Nil(t, passCookieHeader(t, w), "browser form post %+v", c)
+		w = postVerifyWith(t, h, tok, c.ip, c.ua, map[string]string{"Sec-Fetch-Mode": "navigate", "Accept": "text/html"})
+		require.Nil(t, passCookieHeader(t, w), "navigation %+v", c)
 	}
 }
 
@@ -582,6 +600,7 @@ func TestRollingSolveIsSingleUse(t *testing.T) {
 	w := postVerify(t, h, tok, "203.0.113.6", "UA")
 	require.Equal(t, http.StatusForbidden, w.Code)
 	require.Nil(t, passCookieHeader(t, w))
+	require.Nil(t, passCookieHeader(t, postVerifyWith(t, h, tok, "203.0.113.6", "UA", nil)))
 }
 
 func TestDefaultPolicyVerifyStaysReusable(t *testing.T) {
