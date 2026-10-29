@@ -108,9 +108,9 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		st := readTries(r, h.app.Secret(), ip)
+		st := readTries(r, h.app.Secret())
 		st.countFailure()
-		writeTries(w, h.app.Secret(), ip, st)
+		writeTries(w, h.app.Secret(), st)
 		if st.Failed >= maxVerifyTries {
 			writeGaveUpPage(w, ret, false)
 			return nil
@@ -130,17 +130,32 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		MaxAge:   int(cookieTTL.Seconds()),
 	})
 	setOutcome(r, "passed")
-	st := readTries(r, h.app.Secret(), ip)
-	st.countPass(time.Now())
-	writeTries(w, h.app.Secret(), ip, st)
+	st := readTries(r, h.app.Secret())
+	counted := st.countPass(time.Now())
+	writeTries(w, h.app.Secret(), st)
 	if st.Passed >= maxVerifyTries {
 		// Passed repeatedly but never came back with the pass cookie.
 		writeGaveUpPage(w, safeReturn(p.Ret), true)
 		return nil
 	}
+	if !counted {
+		// Another pass in the same round (other tab, Retry, or a loop):
+		// continue after a pause rather than at once, so a loop is slowed.
+		writeContinuePage(w, safeReturn(p.Ret))
+		return nil
+	}
 	w.Header().Set("Location", safeReturn(p.Ret))
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+// writeContinuePage serves the 200 "Continuing…" page that sends the browser
+// on to ret after continueDelay (meta refresh, plus a link without it).
+func writeContinuePage(w http.ResponseWriter, ret string) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(renderContinuePage(ret, int(continueDelay.Seconds()))))
 }
 
 // writeGaveUpPage serves the explanation page (200) that ends a challenge

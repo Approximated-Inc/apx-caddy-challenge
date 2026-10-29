@@ -88,6 +88,38 @@ func renderFailedPage(ret string, passedButNotKept bool) string {
 	).Replace(failedPageHTML)
 }
 
+// continuePageHTML is served (200) for a pass inside the pass-count spacing:
+// the pass cookie is set, and the browser moves on to ret after a pause.
+const continuePageHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="{{DELAY}};url={{RET}}">
+<title>Continuing…</title>
+<style>{{CSS}}</style>
+</head>
+<body>
+<main class="box" id="apx-continue">
+<h1>Continuing…</h1>
+<div class="spinner" aria-hidden="true"></div>
+<p class="muted">Your browser passed the check. Taking you back to the page in a few seconds.</p>
+<p><a class="button button-secondary" href="{{RET}}">Continue now</a></p>
+</main>
+</body>
+</html>
+`
+
+// renderContinuePage renders the "Continuing…" page; ret is sanitized and
+// HTML-escaped for both the meta refresh and the link.
+func renderContinuePage(ret string, delaySeconds int) string {
+	return strings.NewReplacer(
+		"{{CSS}}", pageCSS,
+		"{{RET}}", html.EscapeString(safeReturn(ret)),
+		"{{DELAY}}", strconv.Itoa(delaySeconds),
+	).Replace(continuePageHTML)
+}
+
 // renderVerifyWidget substitutes the endpoint paths into the embedded widget.
 // Served as application/javascript with a long cache + ETag by the handler.
 func renderVerifyWidget(challengePath, tokenPath string) string {
