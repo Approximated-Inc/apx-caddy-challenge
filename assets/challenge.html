@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Checking your browser…</title>
-<style>{{CSS}}</style>
+<style>{{CSS}}{{FALLBACK_CSS}}</style>
 <noscript><style>#apx-checking { display: none; }</style></noscript>
 </head>
 <body>
@@ -24,7 +24,7 @@
 <p class="muted">It can stop on slow devices, on unstable connections, or when an extension blocks scripts. Trying again usually works.</p>
 <p><button type="button" class="button" id="apx-retry" data-apx-retry>Retry</button></p>
 <!-- apx-fallback-slot: reserved for a future human-verification fallback. -->
-<div id="apx-fallback-slot"></div>
+<div id="apx-fallback-slot">{{FALLBACK_SLOT}}</div>
 </div>
 <div id="apx-nocookies" role="alert" hidden>
 <h1>This check needs cookies.</h1>
@@ -34,8 +34,7 @@
 <noscript>
 <div id="apx-noscript">
 <h1>This check didn't finish in your browser.</h1>
-<p class="muted">This site needs JavaScript to check your browser. Turn JavaScript on for this site, then try again.</p>
-<p><a class="button" href="{{RET}}">Try again</a></p>
+{{NOSCRIPT_BODY}}
 </div>
 </noscript>
 <form id="apx-challenge" method="POST" action="{{VERIFY_PATH}}" data-difficulty="{{DIFFICULTY}}">

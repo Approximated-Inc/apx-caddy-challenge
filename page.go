@@ -31,16 +31,31 @@ const defaultChallengeTimeoutMs = 20000
 // HTML response — no separate asset routes to wire. ret is HTML-escaped (it
 // lands in attribute values); timeoutMs <= 0 means the default.
 func renderPage(challengeToken string, difficulty int, verifyPath, ret string, timeoutMs int) string {
+	return renderChallengePage(challengeToken, difficulty, verifyPath, ret, timeoutMs, nil)
+}
+
+// renderChallengePage is renderPage plus the render-check fallback when fb is
+// non-nil. With fb nil the output is byte-identical to the pre-fallback page.
+func renderChallengePage(challengeToken string, difficulty int, verifyPath, ret string, timeoutMs int, fb *fallbackView) string {
 	if timeoutMs <= 0 {
 		timeoutMs = defaultChallengeTimeoutMs
 	}
+	retEsc := html.EscapeString(safeReturn(ret))
+	fbCSS, noscript, slot := "", strings.Replace(noscriptDefaultBody, "{{RET}}", retEsc, 1), ""
+	if fb != nil {
+		fbCSS, noscript, slot = renderFallback(*fb)
+	}
+	// One pass, so substituted values are never rescanned for placeholders.
 	return strings.NewReplacer(
+		"{{FALLBACK_CSS}}", fbCSS,
+		"{{NOSCRIPT_BODY}}", noscript,
+		"{{FALLBACK_SLOT}}", slot,
 		"{{CSS}}", pageCSS,
 		"{{JS}}", powJS,
 		"{{CHALLENGE}}", challengeToken,
 		"{{DIFFICULTY}}", strconv.Itoa(difficulty),
 		"{{VERIFY_PATH}}", verifyPath,
-		"{{RET}}", html.EscapeString(safeReturn(ret)),
+		"{{RET}}", retEsc,
 		"{{TIMEOUT_MS}}", strconv.Itoa(timeoutMs),
 	).Replace(pageHTML)
 }

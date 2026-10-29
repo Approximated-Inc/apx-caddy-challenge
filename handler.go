@@ -58,6 +58,9 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	if r.Method == http.MethodPost && r.URL.Path == h.app.VerifyPath() {
 		return h.handleVerify(w, r, ip)
 	}
+	if h.app.Fallback().Enabled && isFallbackPixelRequest(r, h.app.VerifyPath()) {
+		return h.serveFallbackPixel(w, r)
+	}
 
 	if c, err := r.Cookie(CookieName); err == nil {
 		pol, now := h.app.PassPolicy(), time.Now()
@@ -87,8 +90,18 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	setOutcome(r, "issued")
-	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), safeReturn(r.URL.RequestURI()), time.Now().Add(challengeTokenTTL))
-	body := renderPage(tok, h.app.Difficulty(), h.app.VerifyPath(), r.URL.RequestURI(), defaultChallengeTimeoutMs)
+	now := time.Now()
+	ret := safeReturn(r.URL.RequestURI())
+	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now.Add(challengeTokenTTL))
+	var fb *fallbackView
+	if h.app.Fallback().Enabled && isLikelyDocument(r) {
+		pol := h.app.PassPolicy()
+		ftok, nonce := issueFallbackToken(h.app.Secret(), pol, ip, r.UserAgent(), ret, now)
+		setFallbackCookie(w, h.app.Secret(), withNonce(readFallbackNonces(r, h.app.Secret()), nonce))
+		pixel := fallbackPixelURL(h.app.Secret(), h.app.VerifyPath(), pol, ip, r.UserAgent(), nonce, now.Add(fallbackTokenTTL).Unix())
+		fb = &fallbackView{Token: ftok, PixelURL: pixel, VerifyPath: h.app.VerifyPath(), Ret: ret}
+	}
+	body := renderChallengePage(tok, h.app.Difficulty(), h.app.VerifyPath(), r.URL.RequestURI(), defaultChallengeTimeoutMs, fb)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
@@ -98,55 +111,71 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 
 func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, ip string) error {
 	_ = r.ParseForm()
+	if h.app.Fallback().Enabled && r.FormValue("mode") == fallbackModeValue {
+		return h.handleFallbackVerify(w, r, ip)
+	}
 	challenge := r.FormValue("challenge")
 	solution := r.FormValue("solution")
 
 	pol, now := h.app.PassPolicy(), time.Now()
 	p, err := VerifyPassChallenge(h.app.Secret(), pol, challenge, ip, r.UserAgent(), now)
 	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) || h.replayedSolve(pol, p) {
-		setOutcome(r, "failed")
-		if !isBrowserFormPost(r) {
-			w.WriteHeader(http.StatusForbidden)
-			return nil
-		}
 		// The token's return path when it still verifies, else the page's
 		// hidden ret field (an expired or IP-mismatched token can't be trusted).
 		ret := safeReturn(r.FormValue("ret"))
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		st := readTries(r, h.app.Secret())
-		st.countFailure()
-		writeTries(w, h.app.Secret(), st)
-		if st.Failed >= maxVerifyTries {
-			writeGaveUpPage(w, ret, false)
-			return nil
-		}
-		w.Header().Set("Cache-Control", "private, no-store")
-		w.Header().Set("Location", ret)
-		w.WriteHeader(http.StatusSeeOther)
-		return nil
+		return h.verifyFailed(w, r, ret)
 	}
 	// The cap counts from the challenge's issue, so replaying a token can't reset it.
 	iat := p.IssuedAt(challengeTokenTTL)
 	exp := pol.InitialExp(iat, now)
 	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), iat, exp), exp, now)
 	setOutcome(r, "passed")
+	return h.verifyPassed(w, r, safeReturn(p.Ret))
+}
+
+// verifyFailed answers a failed verify: a bare 403 for scripts; for a browser
+// form post, a counted failure in the tries cookie plus a redirect to a fresh
+// challenge at ret (the explanation page at the threshold).
+func (h *ChallengeHandler) verifyFailed(w http.ResponseWriter, r *http.Request, ret string) error {
+	setOutcome(r, "failed")
+	if !isBrowserFormPost(r) {
+		w.WriteHeader(http.StatusForbidden)
+		return nil
+	}
+	st := readTries(r, h.app.Secret())
+	st.countFailure()
+	writeTries(w, h.app.Secret(), st)
+	if st.Failed >= maxVerifyTries {
+		writeGaveUpPage(w, ret, false)
+		return nil
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Location", ret)
+	w.WriteHeader(http.StatusSeeOther)
+	return nil
+}
+
+// verifyPassed finishes a pass once the pass cookie is set: count it in the
+// tries cookie, then redirect to ret (or the continue / explanation page).
+func (h *ChallengeHandler) verifyPassed(w http.ResponseWriter, r *http.Request, ret string) error {
 	st := readTries(r, h.app.Secret())
 	counted := st.countPass(time.Now())
 	writeTries(w, h.app.Secret(), st)
 	if st.Passed >= maxVerifyTries {
 		// Passed repeatedly but never came back with the pass cookie.
-		writeGaveUpPage(w, safeReturn(p.Ret), true)
+		writeGaveUpPage(w, ret, true)
 		return nil
 	}
 	if !counted {
 		// Another pass in the same round (other tab, Retry, or a loop):
 		// continue after a pause rather than at once, so a loop is slowed.
-		writeContinuePage(w, safeReturn(p.Ret))
+		writeContinuePage(w, ret)
 		return nil
 	}
-	w.Header().Set("Location", safeReturn(p.Ret))
+	w.Header().Set("Location", ret)
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
 }
