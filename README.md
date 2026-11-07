@@ -52,7 +52,7 @@ the reason.
 | `failed` | `expired` | Verify: authentic token past its life (5 minutes, or 10 for the fallback token) |
 | `failed` | `binding` | Verify: authentic, unexpired token issued to another client prefix or, under `pass_bind_user_agent`, another UA |
 | `failed` | `proof` | Verify: valid token, wrong proof-of-work |
-| `failed` | `stale_difficulty` | Verify: the proof fails the current difficulty but meets one that was in force on this machine during the last 10 minutes (tokens do not carry their difficulty) |
+| `failed` | `stale_difficulty` | Verify: the proof fails the current difficulty but meets a lower difficulty that issued a page on this machine during the last 10 minutes (tokens do not carry their difficulty) |
 | `failed` | `replay` | Verify: valid proof-of-work solve already spent on this machine (non-default pass policy only) |
 | `failed` | `render_cookie` | Fallback POST without a fallback cookie naming its nonce (for example a fifth tab pushed it out) |
 | `failed` | `render_pixel` | Fallback POST whose pixel was not loaded on this machine (or was loaded on another one) |
@@ -70,19 +70,23 @@ Known limits:
 
 - **Mixed images.** A fallback cookie minted by an older machine has no `f`, so
   a newer machine records it as a solved `passed_recently`, and an older
-  machine records a newer machine's fallback cookie the same way. Fallback
-  cookies last `fallback_pass_ttl_seconds` (300 s by default), so this lasts
-  at most that long per cookie, and only while a cluster runs both images.
-  The recorded `passed_recently` stays in the app's evidence window longer
-  than that.
-- **Difficulty history is per machine.** Each process keeps the last time each
-  difficulty was in force (from an app instance's `Start` to its `Stop`, and
-  always while an instance is running) for 10 minutes, across reloads. It knows
-  only the difficulties this machine ran, so during config propagation lag a
-  real visitor can record `proof`. After the difficulty is lowered, a page
-  issued by a machine that already has the lower one and posted to a machine
-  still on the higher one fails there. After a raise, the same happens when
-  the page reaches a machine started after the raise. A restart forgets the
+  machine records a newer machine's fallback cookie the same way. A fallback
+  cookie is accepted for `fallback_pass_ttl_seconds` (300 s by default), so
+  new misrecorded rows can still appear for up to that long after the last
+  older machine is replaced. Each row then stays in the app's evidence window,
+  so the effect lasts that window, not just the 300 s.
+- **Difficulty history is per machine.** Each process records, for every
+  difficulty, the last time it issued a challenge page (one atomic store per
+  issued page, no lock), and keeps it across reloads. A failed proof is
+  `stale_difficulty` when it meets a lower difficulty that issued a page on
+  this machine during the last 10 minutes. The history follows pages, not the
+  app lifecycle, so a config Caddy rejects or rolls back records nothing
+  unless it served a page. It knows only this machine's pages, so during
+  config propagation lag a real visitor can record `proof`. After the
+  difficulty is lowered, a page from a machine that already has the lower one
+  fails on a machine still on the higher one. After a raise, the same happens
+  on a machine that issued no page at the old difficulty in the last 10
+  minutes, for example one started after the raise. A restart forgets the
   history: a page issued before a restart that also raised the difficulty
   records `proof`, not `stale_difficulty`.
 

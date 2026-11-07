@@ -20,10 +20,7 @@ type fakeApp struct {
 	sec  string
 	diff int
 	vp   string
-	prev []int // PreviousDifficulties
 }
-
-func (f fakeApp) PreviousDifficulties(time.Time) []int { return f.prev }
 
 func (f fakeApp) Secret() string     { return f.sec }
 func (f fakeApp) Difficulty() int    { return f.diff }

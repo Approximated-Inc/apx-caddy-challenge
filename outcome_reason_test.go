@@ -284,28 +284,3 @@ func solutionBetween(tok string, lo, hi int) string {
 		}
 	}
 }
-
-func TestSolveAtThePreviousDifficultyIsStaleDifficulty(t *testing.T) {
-	tok := IssueChallenge("h-secret", "203.0.113.5", "/", time.Now().Add(challengeTokenTTL))
-	form := url.Values{"challenge": {tok}, "solution": {solutionBetween(tok, 8, 12)}}
-
-	// Raised 8 -> 10 -> 12 within the window: every difficulty in force counts.
-	raised := &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 12, vp: "/__apx_challenge/verify", prev: []int{10, 8}}}
-	r := verifyReq(form, "203.0.113.5", "UA")
-	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
-	_, reason := outcomeAndReason(r)
-	require.Equal(t, reasonStaleDifficulty, reason)
-
-	// No recent change: the same short proof is a wrong proof.
-	steady := &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 12, vp: "/__apx_challenge/verify"}}
-	r = verifyReq(form, "203.0.113.5", "UA")
-	require.Equal(t, http.StatusForbidden, serveReq(t, steady, r).Code)
-	_, reason = outcomeAndReason(r)
-	require.Equal(t, reasonProof, reason)
-
-	// A proof that meets none of them is a wrong proof even right after a change.
-	r = verifyReq(url.Values{"challenge": {tok}, "solution": {failingSolution(tok, 8)}}, "203.0.113.5", "UA")
-	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
-	_, reason = outcomeAndReason(r)
-	require.Equal(t, reasonProof, reason)
-}

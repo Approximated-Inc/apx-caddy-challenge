@@ -2,7 +2,7 @@ package apxchallenge
 
 import (
 	"fmt"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -36,9 +36,6 @@ type AppRef interface {
 	Fallback() FallbackConfig
 	// FallbackState is the process-wide rendered-nonce set and pass budget.
 	FallbackState() *FallbackState
-	// PreviousDifficulties are the PoW difficulties, other than this app's,
-	// in force on this machine now or during the last staleDifficultyWindow.
-	PreviousDifficulties(now time.Time) []int
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -112,8 +109,6 @@ type ChallengeApp struct {
 	replayLRU        *NonceLRU
 	passPolicy       PassPolicy
 	fallback         FallbackConfig
-	// difficulties is processDifficulties unless a test injects its own.
-	difficulties *difficultyHistory
 }
 
 // defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
@@ -149,10 +144,6 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.secret == "" {
 		return fmt.Errorf("apx_challenge app: secret is required (config key \"secret\")")
 	}
-	if a.difficulties == nil {
-		a.difficulties = processDifficulties
-	}
-
 	if a.verifyDifficulty = a.VerifyDifficultyCfg; a.verifyDifficulty <= 0 {
 		a.verifyDifficulty = 14
 	}
@@ -238,17 +229,8 @@ func buildPassPolicy(idleS, maxS, v4, v6 int, bindUA bool) (PassPolicy, error) {
 	return pol, nil
 }
 
-// Start and Stop bracket the time this instance's difficulty is in force.
-// Caddy stops an instance it started when another app then fails to start,
-// and stops the old instance after a reload starts the new one.
-func (a *ChallengeApp) Start() error {
-	a.difficulties.start(a.difficulty)
-	return nil
-}
-func (a *ChallengeApp) Stop() error {
-	a.difficulties.stop(a.difficulty)
-	return nil
-}
+func (a *ChallengeApp) Start() error { return nil }
+func (a *ChallengeApp) Stop() error  { return nil }
 
 func (a *ChallengeApp) Secret() string     { return a.secret }
 func (a *ChallengeApp) Difficulty() int    { return a.difficulty }
@@ -263,86 +245,44 @@ func (a *ChallengeApp) PassPolicy() PassPolicy        { return a.passPolicy }
 func (a *ChallengeApp) Fallback() FallbackConfig      { return a.fallback }
 func (a *ChallengeApp) FallbackState() *FallbackState { return processFallbackState }
 
-func (a *ChallengeApp) PreviousDifficulties(now time.Time) []int {
-	if a.difficulties == nil {
-		return nil
-	}
-	return a.difficulties.inForceSince(now.Add(-staleDifficultyWindow), a.difficulty)
-}
-
-// staleDifficultyWindow is how long after a difficulty stops being in force a
+// staleDifficultyWindow is how long after a difficulty last issued a page a
 // solve at it is still recognised: the challenge token's life plus time for
 // the config to reach every machine.
 const staleDifficultyWindow = 2 * challengeTokenTTL
 
-// difficultyHistory remembers every PoW difficulty that was in force on this
-// machine during the last staleDifficultyWindow. Challenge tokens do not
-// carry their difficulty (the default-policy token is byte-identical to the
-// original format), so a page issued just before a config reload raised it
-// would otherwise fail its solve as a wrong proof. A difficulty is in force
-// from an instance's Start until its Stop, and always while an instance
-// running it is started. It lives at process level, like the replay set, so
-// a reload keeps it; a restart forgets it. It holds one entry per distinct
-// difficulty value.
+// maxTrackedDifficulty is the highest difficulty a proof can meet: SHA-256
+// has 256 bits.
+const maxTrackedDifficulty = 256
+
+// difficultyHistory records when each PoW difficulty last issued a challenge
+// page on this machine. Challenge tokens do not carry their difficulty (the
+// default-policy token is byte-identical to the original format), so a page
+// issued just before a config reload raised it would otherwise fail its solve
+// as a wrong proof. It follows issued pages, not the app lifecycle, so a
+// config Caddy rejects or rolls back records nothing unless it served a page.
+// Issuing a page costs one atomic store. It lives at process level, like the
+// replay set, so a reload keeps it; a restart forgets it.
 type difficultyHistory struct {
-	mu sync.Mutex
-	// running counts the started, not yet stopped, instances per difficulty.
-	running map[int]int
-	// lastInForce is the last Start or Stop of an instance per difficulty.
-	lastInForce map[int]time.Time
-	// now is time.Now unless a test injects a clock.
-	now func() time.Time
+	lastIssued [maxTrackedDifficulty + 1]atomic.Int64 // unix nanoseconds, 0 = never
 }
 
 var processDifficulties = &difficultyHistory{}
 
-func (d *difficultyHistory) clock() time.Time {
-	if d.now != nil {
-		return d.now()
+// issued records that a page at difficulty was issued at now.
+func (d *difficultyHistory) issued(difficulty int, now time.Time) {
+	if difficulty < 1 || difficulty > maxTrackedDifficulty {
+		return
 	}
-	return time.Now()
+	d.lastIssued[difficulty].Store(now.UnixNano())
 }
 
-func (d *difficultyHistory) start(difficulty int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.running == nil {
-		d.running, d.lastInForce = map[int]int{}, map[int]time.Time{}
+// issuedSince reports whether difficulty issued a page at or after since.
+func (d *difficultyHistory) issuedSince(difficulty int, since time.Time) bool {
+	if difficulty < 1 || difficulty > maxTrackedDifficulty {
+		return false
 	}
-	d.running[difficulty]++
-	d.lastInForce[difficulty] = d.clock()
-}
-
-func (d *difficultyHistory) stop(difficulty int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.running[difficulty] <= 0 {
-		return // never started (Caddy stops only started apps, but be safe)
-	}
-	now := d.clock()
-	if d.running[difficulty]--; d.running[difficulty] == 0 {
-		delete(d.running, difficulty)
-	}
-	d.lastInForce[difficulty] = now
-	for diff, at := range d.lastInForce {
-		if d.running[diff] == 0 && now.Sub(at) > staleDifficultyWindow {
-			delete(d.lastInForce, diff)
-		}
-	}
-}
-
-// inForceSince returns the difficulties other than except that are in force
-// now or were at or after since.
-func (d *difficultyHistory) inForceSince(since time.Time, except int) []int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	var out []int
-	for diff, at := range d.lastInForce {
-		if diff != except && (d.running[diff] > 0 || !at.Before(since)) {
-			out = append(out, diff)
-		}
-	}
-	return out
+	at := d.lastIssued[difficulty].Load()
+	return at != 0 && at >= since.UnixNano()
 }
 
 var (
