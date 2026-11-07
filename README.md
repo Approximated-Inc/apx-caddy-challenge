@@ -73,11 +73,18 @@ Known limits:
   machine records a newer machine's fallback cookie the same way. Fallback
   cookies last `fallback_pass_ttl_seconds` (300 s by default), so this lasts
   at most that long per cookie, and only while a cluster runs both images.
-- **Difficulty after a restart.** The difficulties in force during the last 10
-  minutes are kept per process, recorded when the config starts (a config
-  rejected at load never records its difficulty), and survive reloads. A
-  restart forgets them: a page issued before a restart that also raised the
-  difficulty records `proof`, not `stale_difficulty`.
+  The recorded `passed_recently` stays in the app's evidence window longer
+  than that.
+- **Difficulty history is per machine.** Each process keeps the last time each
+  difficulty was in force (from an app instance's `Start` to its `Stop`, and
+  always while an instance is running) for 10 minutes, across reloads. It knows
+  only the difficulties this machine ran, so during config propagation lag a
+  real visitor can record `proof`. After the difficulty is lowered, a page
+  issued by a machine that already has the lower one and posted to a machine
+  still on the higher one fails there. After a raise, the same happens when
+  the page reaches a machine started after the raise. A restart forgets the
+  history: a page issued before a restart that also raised the difficulty
+  records `proof`, not `stale_difficulty`.
 
 ## Config (emitted by Phoenix — not hand-written)
 

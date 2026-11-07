@@ -36,8 +36,8 @@ type AppRef interface {
 	Fallback() FallbackConfig
 	// FallbackState is the process-wide rendered-nonce set and pass budget.
 	FallbackState() *FallbackState
-	// PreviousDifficulties are the PoW difficulties, other than the current
-	// one, in force while a page issued under them may still be verified.
+	// PreviousDifficulties are the PoW difficulties, other than this app's,
+	// in force on this machine now or during the last staleDifficultyWindow.
 	PreviousDifficulties(now time.Time) []int
 }
 
@@ -238,13 +238,17 @@ func buildPassPolicy(idleS, maxS, v4, v6 int, bindUA bool) (PassPolicy, error) {
 	return pol, nil
 }
 
-// Start records the difficulty as in force: Caddy starts apps only after the
-// whole config provisioned and validated, so a rejected config never does.
+// Start and Stop bracket the time this instance's difficulty is in force.
+// Caddy stops an instance it started when another app then fails to start,
+// and stops the old instance after a reload starts the new one.
 func (a *ChallengeApp) Start() error {
-	a.difficulties.record(a.difficulty, time.Now())
+	a.difficulties.start(a.difficulty)
 	return nil
 }
-func (a *ChallengeApp) Stop() error { return nil }
+func (a *ChallengeApp) Stop() error {
+	a.difficulties.stop(a.difficulty)
+	return nil
+}
 
 func (a *ChallengeApp) Secret() string     { return a.secret }
 func (a *ChallengeApp) Difficulty() int    { return a.difficulty }
@@ -263,7 +267,7 @@ func (a *ChallengeApp) PreviousDifficulties(now time.Time) []int {
 	if a.difficulties == nil {
 		return nil
 	}
-	return a.difficulties.replacedSince(now.Add(-staleDifficultyWindow))
+	return a.difficulties.inForceSince(now.Add(-staleDifficultyWindow), a.difficulty)
 }
 
 // staleDifficultyWindow is how long after a difficulty stops being in force a
@@ -271,60 +275,71 @@ func (a *ChallengeApp) PreviousDifficulties(now time.Time) []int {
 // the config to reach every machine.
 const staleDifficultyWindow = 2 * challengeTokenTTL
 
-// maxDifficultyHistory bounds the replaced difficulties kept; a burst of
-// reloads inside the window keeps the most recent ones.
-const maxDifficultyHistory = 32
-
 // difficultyHistory remembers every PoW difficulty that was in force on this
 // machine during the last staleDifficultyWindow. Challenge tokens do not
 // carry their difficulty (the default-policy token is byte-identical to the
 // original format), so a page issued just before a config reload raised it
-// would otherwise fail its solve as a wrong proof. It lives at process level,
-// like the replay set, so a reload keeps it; a restart forgets it.
+// would otherwise fail its solve as a wrong proof. A difficulty is in force
+// from an instance's Start until its Stop, and always while an instance
+// running it is started. It lives at process level, like the replay set, so
+// a reload keeps it; a restart forgets it. It holds one entry per distinct
+// difficulty value.
 type difficultyHistory struct {
-	mu       sync.Mutex
-	current  int
-	replaced []replacedDifficulty
-}
-
-// replacedDifficulty is a difficulty that was in force until until.
-type replacedDifficulty struct {
-	difficulty int
-	until      time.Time
+	mu sync.Mutex
+	// running counts the started, not yet stopped, instances per difficulty.
+	running map[int]int
+	// lastInForce is the last Start or Stop of an instance per difficulty.
+	lastInForce map[int]time.Time
+	// now is time.Now unless a test injects a clock.
+	now func() time.Time
 }
 
 var processDifficulties = &difficultyHistory{}
 
-// record makes difficulty the one in force from now. Called from Start, so a
-// config that fails to load never reaches it.
-func (d *difficultyHistory) record(difficulty int, now time.Time) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.current != 0 && d.current != difficulty {
-		d.replaced = append(d.replaced, replacedDifficulty{difficulty: d.current, until: now})
+func (d *difficultyHistory) clock() time.Time {
+	if d.now != nil {
+		return d.now()
 	}
-	d.current = difficulty
-	keep := d.replaced[:0]
-	for _, r := range d.replaced {
-		if now.Sub(r.until) <= staleDifficultyWindow {
-			keep = append(keep, r)
-		}
-	}
-	if len(keep) > maxDifficultyHistory {
-		keep = keep[len(keep)-maxDifficultyHistory:]
-	}
-	d.replaced = keep
+	return time.Now()
 }
 
-// replacedSince returns the difficulties, other than the current one, that
-// were in force at or after since.
-func (d *difficultyHistory) replacedSince(since time.Time) []int {
+func (d *difficultyHistory) start(difficulty int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.running == nil {
+		d.running, d.lastInForce = map[int]int{}, map[int]time.Time{}
+	}
+	d.running[difficulty]++
+	d.lastInForce[difficulty] = d.clock()
+}
+
+func (d *difficultyHistory) stop(difficulty int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.running[difficulty] <= 0 {
+		return // never started (Caddy stops only started apps, but be safe)
+	}
+	now := d.clock()
+	if d.running[difficulty]--; d.running[difficulty] == 0 {
+		delete(d.running, difficulty)
+	}
+	d.lastInForce[difficulty] = now
+	for diff, at := range d.lastInForce {
+		if d.running[diff] == 0 && now.Sub(at) > staleDifficultyWindow {
+			delete(d.lastInForce, diff)
+		}
+	}
+}
+
+// inForceSince returns the difficulties other than except that are in force
+// now or were at or after since.
+func (d *difficultyHistory) inForceSince(since time.Time, except int) []int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var out []int
-	for _, r := range d.replaced {
-		if !r.until.Before(since) && r.difficulty != d.current {
-			out = append(out, r.difficulty)
+	for diff, at := range d.lastInForce {
+		if diff != except && (d.running[diff] > 0 || !at.Before(since)) {
+			out = append(out, diff)
 		}
 	}
 	return out

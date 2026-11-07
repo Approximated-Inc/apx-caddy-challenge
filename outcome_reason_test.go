@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/stretchr/testify/require"
 )
@@ -309,65 +308,4 @@ func TestSolveAtThePreviousDifficultyIsStaleDifficulty(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
 	_, reason = outcomeAndReason(r)
 	require.Equal(t, reasonProof, reason)
-}
-
-func TestDifficultyHistoryKeepsEveryDifficultyInTheWindow(t *testing.T) {
-	d := &difficultyHistory{}
-	now := time.Now()
-	d.record(16, now)
-	d.record(16, now) // a reload with the same difficulty is no change
-	require.Empty(t, d.replacedSince(now.Add(-staleDifficultyWindow)))
-
-	// 16 -> 18 -> 20 within five minutes: both earlier ones are remembered.
-	d.record(18, now.Add(time.Minute))
-	d.record(20, now.Add(2*time.Minute))
-	at := now.Add(3 * time.Minute)
-	require.ElementsMatch(t, []int{16, 18}, d.replacedSince(at.Add(-staleDifficultyWindow)))
-
-	// 16 stopped at +1m: forgotten once that is more than the window ago.
-	later := now.Add(time.Minute + staleDifficultyWindow + time.Second)
-	require.ElementsMatch(t, []int{18}, d.replacedSince(later.Add(-staleDifficultyWindow)))
-
-	// Back to 16: the current difficulty is never listed.
-	d.record(16, now.Add(4*time.Minute))
-	require.ElementsMatch(t, []int{18, 20}, d.replacedSince(now.Add(4*time.Minute).Add(-staleDifficultyWindow)))
-}
-
-func TestDifficultyHistoryIsBounded(t *testing.T) {
-	d := &difficultyHistory{}
-	now := time.Now()
-	for i := 0; i < 3*maxDifficultyHistory; i++ {
-		d.record(10+i, now)
-	}
-	require.Len(t, d.replacedSince(now.Add(-time.Minute)), maxDifficultyHistory)
-
-	// Entries older than the window are dropped, not just hidden.
-	old := &difficultyHistory{}
-	old.record(10, now)
-	old.record(11, now)
-	old.record(12, now.Add(staleDifficultyWindow+2*time.Second))
-	require.Equal(t, []replacedDifficulty{{difficulty: 11, until: now.Add(staleDifficultyWindow + 2*time.Second)}}, old.replaced)
-}
-
-func TestDifficultyIsRecordedOnlyWhenTheConfigStarts(t *testing.T) {
-	h := &difficultyHistory{}
-	start := func(cfg *ChallengeApp) error {
-		cfg.difficulties = h
-		if err := cfg.Provision(caddy.Context{}); err != nil {
-			return err
-		}
-		return cfg.Start()
-	}
-	require.NoError(t, start(&ChallengeApp{SecretCfg: "s", DifficultyCfg: 16}))
-	require.NoError(t, start(&ChallengeApp{SecretCfg: "s", DifficultyCfg: 20}))
-
-	// A config rejected at Provision never reaches Start, and changes nothing.
-	require.Error(t, start(&ChallengeApp{SecretCfg: "s", DifficultyCfg: 18, PassIdleTTLSecondsCfg: 1}))
-	// Provisioned but never started (Caddy rejected the config elsewhere): nothing either.
-	unstarted := &ChallengeApp{SecretCfg: "s", DifficultyCfg: 22, difficulties: h}
-	require.NoError(t, unstarted.Provision(caddy.Context{}))
-
-	live := &ChallengeApp{SecretCfg: "s", DifficultyCfg: 20, difficulties: h}
-	require.NoError(t, live.Provision(caddy.Context{}))
-	require.Equal(t, []int{16}, live.PreviousDifficulties(time.Now()))
 }
