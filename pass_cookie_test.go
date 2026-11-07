@@ -724,7 +724,7 @@ func TestFailedPoWDoesNotSpendSolve(t *testing.T) {
 	h := policyHandler(pol)
 	tok := IssuePassChallenge("h-secret", pol, "203.0.113.5", "UA", "/x", time.Now().Add(challengeTokenTTL))
 
-	form := url.Values{"challenge": {tok}, "solution": {"wrong"}}
+	form := url.Values{"challenge": {tok}, "solution": {failingSolution(tok, 8)}}
 	r := httptest.NewRequest("POST", "/__apx_challenge/verify", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Set("Sec-Fetch-Mode", "cors")

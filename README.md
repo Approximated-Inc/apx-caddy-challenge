@@ -34,6 +34,69 @@ The handler sets the `apx_challenge_outcome` request var
 apx-caddy-stats recorder (Phase 9c). `passed_fallback` appears only when the
 render-check fallback below is on. The fallback pixel request sets no outcome.
 
+Beside every `issued` and `failed` outcome it also sets
+`apx_challenge_reason`, which says what happened. The outcome var keeps its
+five values, because the app's response guard route matches `issued` and the
+stats recorder's request-event disposition reads it. apx-caddy-stats (from
+the version that reads the reason) composes the two into the stored outcome,
+for example `issued_document` or `failed_proof`; an older recorder ignores
+the reason.
+
+| Outcome | Reason | When |
+|---|---|---|
+| `issued` | `document` | Page served to a request that is not HEAD, not a prefetch, and has `Sec-Fetch-Dest: document` or an `Accept` containing `text/html` (the fallback's document test) |
+| `issued` | `other` | Page served to anything else: HEAD, `Accept: */*`, subresources, prefetches (`Sec-Purpose: prefetch`, `Purpose: prefetch`) |
+| `failed` | `api` | 429 to a likely API client: no page shown |
+| `failed` | `stream` | 503 to WebSocket or SSE: no page shown |
+| `failed` | `token` | Verify: token missing, malformed or not signed by this cluster (also the fallback token) |
+| `failed` | `expired` | Verify: authentic token past its life (5 minutes, or 10 for the fallback token) |
+| `failed` | `binding` | Verify: authentic, unexpired token issued to another client prefix or, under `pass_bind_user_agent`, another UA |
+| `failed` | `proof` | Verify: valid token, wrong proof-of-work |
+| `failed` | `stale_difficulty` | Verify: the proof fails the current difficulty but meets a lower difficulty that issued a page on this machine during the last 10 minutes (tokens do not carry their difficulty) |
+| `failed` | `replay` | Verify: valid proof-of-work solve already spent on this machine (non-default pass policy only) |
+| `failed` | `render_cookie` | Fallback POST without a fallback cookie naming its nonce (for example a fifth tab pushed it out) |
+| `failed` | `render_pixel` | Fallback POST whose pixel was not loaded on this machine (or was loaded on another one) |
+| `failed` | `render_dwell` | Fallback POST before the minimum dwell |
+| `failed` | `fallback_replay` | Fallback nonce already spent (for example a double-clicked Continue) |
+| `failed` | `fallback_limit` | Fallback POST over the prefix's hourly budget |
+| `passed_recently` | `fallback` | The pass cookie was earned through the render-check fallback |
+
+Other passes set no reason. A pass cookie earned through the fallback carries
+`"f":true` in its signed body, kept across rolling renewal. Older images
+ignore the key and accept the cookie; cookies without it, including every
+cookie minted by an older image, are treated as solved.
+
+Known limits:
+
+- **Mixed images.** A fallback cookie minted by an older machine has no `f`, so
+  a newer machine records it as a solved `passed_recently`, and an older
+  machine records a newer machine's fallback cookie the same way. A fallback
+  cookie is accepted for `fallback_pass_ttl_seconds` (300 s by default), so
+  new misrecorded rows can still appear for up to that long after the last
+  older machine is replaced. Each row then stays in the app's evidence window,
+  so the effect lasts that window, not just the 300 s.
+- **Difficulty history is per machine.** Each process records, for every
+  difficulty, the last time it issued a challenge page (one atomic store per
+  issued page, no lock), and keeps it across reloads. A failed proof is
+  `stale_difficulty` when it meets a lower difficulty that issued a page on
+  this machine during the last 10 minutes. The history follows pages, not the
+  app lifecycle, so a config Caddy rejects or rolls back records nothing
+  unless it served a page. It knows only this machine's pages, so during
+  config propagation lag a real visitor can record `proof`. After the
+  difficulty is lowered, a page from a machine that already has the lower one
+  fails on a machine still on the higher one. After a raise, the same happens
+  on a machine that issued no page at the old difficulty in the last 10
+  minutes, for example one started after the raise. A restart forgets the
+  history: a page issued before a restart that also raised the difficulty
+  records `proof`, not `stale_difficulty`. Times are monotonic offsets from
+  process start, so a wall-clock step does not change the window.
+- **Stale difficulty can be claimed.** Tokens do not carry their difficulty,
+  so the verify cannot tell which difficulty a token was issued at. For 10
+  minutes after a raise, a script that does real proof-of-work at the
+  recently used lower difficulty, on a fresh token issued at the new one,
+  records `stale_difficulty` (neutral, and it counts as responding) instead of
+  `proof`. It still gets no pass cookie and stays challenged.
+
 ## Config (emitted by Phoenix — not hand-written)
 
     "apps": { "apx_challenge": {
@@ -334,6 +397,6 @@ and its failure, the pixel endpoint and what counts as a render, concurrent
 replays, the stores, the non-rolling cookie, the opt-out, a golden test that
 the opted-out page is byte-identical to the pre-fallback page, and a golden of
 the default page), the handler (serve/verify/cookie-gate/non-browser/outcome
-var), and page rendering. The real browser solve-and-redirect (incl. slow network +
+var, and the reason beside each issued and failed outcome), and page rendering. The real browser solve-and-redirect (incl. slow network +
 budget mobile to validate difficulty-16 solve time) is verified on the canary,
 not in CI.

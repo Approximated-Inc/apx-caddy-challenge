@@ -2,6 +2,7 @@ package apxchallenge
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -143,7 +144,6 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.secret == "" {
 		return fmt.Errorf("apx_challenge app: secret is required (config key \"secret\")")
 	}
-
 	if a.verifyDifficulty = a.VerifyDifficultyCfg; a.verifyDifficulty <= 0 {
 		a.verifyDifficulty = 14
 	}
@@ -244,6 +244,62 @@ func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }
 func (a *ChallengeApp) PassPolicy() PassPolicy        { return a.passPolicy }
 func (a *ChallengeApp) Fallback() FallbackConfig      { return a.fallback }
 func (a *ChallengeApp) FallbackState() *FallbackState { return processFallbackState }
+
+// staleDifficultyWindow is how long after a difficulty last issued a page a
+// solve at it is still recognised: the challenge token's life plus time for
+// the config to reach every machine.
+const staleDifficultyWindow = 2 * challengeTokenTTL
+
+// maxTrackedDifficulty is the highest difficulty a proof can meet: SHA-256
+// has 256 bits.
+const maxTrackedDifficulty = 256
+
+// difficultyHistory records when each PoW difficulty last issued a challenge
+// page on this machine. Challenge tokens do not carry their difficulty (the
+// default-policy token is byte-identical to the original format), so a page
+// issued just before a config reload raised it would otherwise fail its solve
+// as a wrong proof. It follows issued pages, not the app lifecycle, so a
+// config Caddy rejects or rolls back records nothing unless it served a page.
+// Times are monotonic offsets from process start, so a wall-clock step never
+// stretches or shortens the window. Issuing a page costs one atomic store. It
+// lives at process level, like the replay set, so a reload keeps it; a restart
+// forgets it.
+type difficultyHistory struct {
+	// lastIssued holds the elapsed nanoseconds at the last page, plus one;
+	// 0 means never.
+	lastIssued [maxTrackedDifficulty + 1]atomic.Int64
+	// elapsed is time since processStart unless a test injects a clock.
+	elapsed func() time.Duration
+}
+
+// processStart carries the monotonic clock reading every offset counts from.
+var processStart = time.Now()
+
+var processDifficulties = &difficultyHistory{}
+
+func (d *difficultyHistory) now() time.Duration {
+	if d.elapsed != nil {
+		return d.elapsed()
+	}
+	return time.Since(processStart)
+}
+
+// issued records that a page at difficulty was issued now.
+func (d *difficultyHistory) issued(difficulty int) {
+	if difficulty < 1 || difficulty > maxTrackedDifficulty {
+		return
+	}
+	d.lastIssued[difficulty].Store(int64(max(d.now(), 0)) + 1)
+}
+
+// issuedWithin reports whether difficulty issued a page during the last window.
+func (d *difficultyHistory) issuedWithin(difficulty int, window time.Duration) bool {
+	if difficulty < 1 || difficulty > maxTrackedDifficulty {
+		return false
+	}
+	at := d.lastIssued[difficulty].Load()
+	return at != 0 && d.now()-time.Duration(at-1) <= window
+}
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)

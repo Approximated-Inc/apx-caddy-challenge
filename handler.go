@@ -1,6 +1,7 @@
 package apxchallenge
 
 import (
+	"errors"
 	"fmt"
 	"mime"
 	"net"
@@ -18,6 +19,30 @@ const (
 	cookieTTL         = 10 * time.Minute
 	challengeTokenTTL = 5 * time.Minute
 	outcomeVarKey     = "apx_challenge_outcome"
+	reasonVarKey      = "apx_challenge_reason"
+)
+
+// Reasons recorded in apx_challenge_reason beside an issued or failed outcome.
+// apx-caddy-stats composes them into the stored outcome (issued_document,
+// not_shown_api, failed_proof, ...). The outcome var itself keeps its five
+// values, which the response guard route and request-event dispositions match.
+const (
+	reasonDocument        = "document"         // issued: page served to a likely displayed document
+	reasonOther           = "other"            // issued: page served to anything else (HEAD, subresource, */*)
+	reasonAPI             = "api"              // failed: 429, no page shown to a likely API client
+	reasonStream          = "stream"           // failed: 503, no page shown to WebSocket or SSE
+	reasonToken           = "token"            // failed: token missing, malformed or forged
+	reasonExpired         = "expired"          // failed: authentic token past its life
+	reasonBinding         = "binding"          // failed: authentic token for another client prefix or UA
+	reasonProof           = "proof"            // failed: valid token, wrong proof-of-work
+	reasonStaleDifficulty = "stale_difficulty" // failed: proof meets the difficulty before a recent change, not the current one
+	reasonReplay          = "replay"           // failed: valid proof-of-work solve already spent
+	reasonRenderCookie    = "render_cookie"    // failed: fallback POST without the fallback cookie naming its nonce
+	reasonRenderPixel     = "render_pixel"     // failed: fallback POST whose pixel was not loaded on this machine
+	reasonRenderDwell     = "render_dwell"     // failed: fallback POST before the minimum dwell
+	reasonFallbackReplay  = "fallback_replay"  // failed: fallback nonce already spent (a double-clicked Continue)
+	reasonFallbackLimit   = "fallback_limit"   // failed: fallback budget for the prefix used up
+	reasonFallback        = "fallback"         // passed_recently: the pass cookie was earned through the fallback
 )
 
 // ChallengeHandler serves the PoW challenge / verifies solutions. Invoked by the
@@ -25,6 +50,27 @@ const (
 type ChallengeHandler struct {
 	logger *zap.Logger
 	app    AppRef
+	// difficulties is processDifficulties unless a test injects its own.
+	difficulties *difficultyHistory
+}
+
+func (h *ChallengeHandler) history() *difficultyHistory {
+	if h.difficulties != nil {
+		return h.difficulties
+	}
+	return processDifficulties
+}
+
+// staleDifficulty reports whether a proof that fails the handler's difficulty
+// meets a lower one that issued a page on this machine during the last
+// staleDifficultyWindow. Only failed proofs pay for it.
+func (h *ChallengeHandler) staleDifficulty(challenge, solution string) bool {
+	for d, z := 1, leadingZeroBits(challenge, solution); d <= z && d < h.app.Difficulty(); d++ {
+		if h.history().issuedWithin(d, staleDifficultyWindow) {
+			return true
+		}
+	}
+	return false
 }
 
 func (*ChallengeHandler) CaddyModule() caddy.ModuleInfo {
@@ -66,9 +112,13 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		pol, now := h.app.PassPolicy(), time.Now()
 		if pc, ok := VerifyPassCookie(h.app.Secret(), pol, c.Value, ip, r.UserAgent(), now); ok {
 			if exp, renew := pol.Renewal(pc, now); renew {
-				setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp), exp, now)
+				setPassCookie(w, issuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp, pc.Fallback), exp, now)
 			}
-			setOutcome(r, "passed_recently")
+			if pc.Fallback {
+				setOutcomeReason(r, "passed_recently", reasonFallback)
+			} else {
+				setOutcome(r, "passed_recently")
+			}
 			clearTriesCookie(w, r) // apx-challenge-failure-states: pass cookie works, reset the loop breaker
 			// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
 			return next.ServeHTTP(w, r)
@@ -76,23 +126,28 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	if isWebSocketOrSSE(r) {
-		setOutcome(r, "failed")
+		setOutcomeReason(r, "failed", reasonStream)
 		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return nil
 	}
 	if isLikelyAPIClient(r) {
-		setOutcome(r, "failed")
+		setOutcomeReason(r, "failed", reasonAPI)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"error":"challenge_required","retry_after":30}`))
 		return nil
 	}
 
-	setOutcome(r, "issued")
+	if r.Method != http.MethodHead && isLikelyDocument(r) && !isPrefetch(r) {
+		setOutcomeReason(r, "issued", reasonDocument)
+	} else {
+		setOutcomeReason(r, "issued", reasonOther)
+	}
 	now := time.Now()
 	ret := safeReturn(r.URL.RequestURI())
 	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now.Add(challengeTokenTTL))
+	h.history().issued(h.app.Difficulty())
 	var fb *fallbackView
 	if h.app.Fallback().Enabled && isLikelyDocument(r) {
 		pol := h.app.PassPolicy()
@@ -119,14 +174,27 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 
 	pol, now := h.app.PassPolicy(), time.Now()
 	p, err := VerifyPassChallenge(h.app.Secret(), pol, challenge, ip, r.UserAgent(), now)
-	if err != nil || !VerifyPoW(challenge, solution, h.app.Difficulty()) || h.replayedSolve(pol, p) {
+	reason := tokenFailureReason(err)
+	switch {
+	case reason != "":
+	case !VerifyPoW(challenge, solution, h.app.Difficulty()):
+		reason = reasonProof
+		// Solved at a difficulty that issued pages here during the last few
+		// minutes: the page may have been one of them.
+		if h.staleDifficulty(challenge, solution) {
+			reason = reasonStaleDifficulty
+		}
+	case h.replayedSolve(pol, p): // only after the token and proof verify: it spends the solve
+		reason = reasonReplay
+	}
+	if reason != "" {
 		// The token's return path when it still verifies, else the page's
 		// hidden ret field (an expired or IP-mismatched token can't be trusted).
 		ret := safeReturn(r.FormValue("ret"))
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		return h.verifyFailed(w, r, ret)
+		return h.verifyFailed(w, r, ret, reason)
 	}
 	// The cap counts from the challenge's issue, so replaying a token can't reset it.
 	iat := p.IssuedAt(challengeTokenTTL)
@@ -136,11 +204,27 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	return h.verifyPassed(w, r, safeReturn(p.Ret))
 }
 
+// tokenFailureReason names why a challenge or fallback token did not verify,
+// or "" when it did.
+func tokenFailureReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, errExpired):
+		return reasonExpired
+	case errors.Is(err, errBinding):
+		return reasonBinding
+	default:
+		return reasonToken
+	}
+}
+
 // verifyFailed answers a failed verify: a bare 403 for scripts; for a browser
 // form post, a counted failure in the tries cookie plus a redirect to a fresh
-// challenge at ret (the explanation page at the threshold).
-func (h *ChallengeHandler) verifyFailed(w http.ResponseWriter, r *http.Request, ret string) error {
-	setOutcome(r, "failed")
+// challenge at ret (the explanation page at the threshold). reason is recorded
+// beside the failed outcome.
+func (h *ChallengeHandler) verifyFailed(w http.ResponseWriter, r *http.Request, ret, reason string) error {
+	setOutcomeReason(r, "failed", reason)
 	if !isBrowserFormPost(r) {
 		w.WriteHeader(http.StatusForbidden)
 		return nil
@@ -230,6 +314,12 @@ func setOutcome(r *http.Request, outcome string) {
 	caddyhttp.SetVar(r.Context(), outcomeVarKey, outcome)
 }
 
+// setOutcomeReason sets the outcome and the reason recorded beside it.
+func setOutcomeReason(r *http.Request, outcome, reason string) {
+	setOutcome(r, outcome)
+	caddyhttp.SetVar(r.Context(), reasonVarKey, reason)
+}
+
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -255,6 +345,13 @@ func safeReturn(ret string) string {
 		}
 	}
 	return ret
+}
+
+// isPrefetch reports a speculative fetch (Sec-Purpose: prefetch, possibly
+// with prerender, or the older Purpose: prefetch) that the visitor may never see.
+func isPrefetch(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Sec-Purpose")), "prefetch") ||
+		strings.EqualFold(r.Header.Get("Purpose"), "prefetch")
 }
 
 func isWebSocketOrSSE(r *http.Request) bool {
