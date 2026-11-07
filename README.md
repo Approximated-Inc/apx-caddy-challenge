@@ -88,7 +88,14 @@ Known limits:
   on a machine that issued no page at the old difficulty in the last 10
   minutes, for example one started after the raise. A restart forgets the
   history: a page issued before a restart that also raised the difficulty
-  records `proof`, not `stale_difficulty`.
+  records `proof`, not `stale_difficulty`. Times are monotonic offsets from
+  process start, so a wall-clock step does not change the window.
+- **Stale difficulty can be claimed.** Tokens do not carry their difficulty,
+  so the verify cannot tell which difficulty a token was issued at. For 10
+  minutes after a raise, a script that does real proof-of-work at the
+  recently used lower difficulty, on a fresh token issued at the new one,
+  records `stale_difficulty` (neutral, and it counts as responding) instead of
+  `proof`. It still gets no pass cookie and stays challenged.
 
 ## Config (emitted by Phoenix — not hand-written)
 

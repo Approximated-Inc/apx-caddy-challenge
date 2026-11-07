@@ -59,34 +59,54 @@ func TestDifficultyThatNeverIssuedAPageIsNotAccepted(t *testing.T) {
 	// The proof meets 8 and 9, which never issued a page here, but not 10.
 	require.Equal(t, reasonProof, verifyReason(t, handlerAt(12, d), 8, 10))
 
-	// A page issued just over the window ago no longer counts; just inside does.
-	old := &difficultyHistory{}
-	old.issued(8, time.Now().Add(-10*time.Minute-time.Second))
-	require.Equal(t, reasonProof, verifyReason(t, handlerAt(12, old), 8, 12))
-	old.issued(8, time.Now().Add(-10*time.Minute+5*time.Second))
-	require.Equal(t, reasonStaleDifficulty, verifyReason(t, handlerAt(12, old), 8, 12))
-
 	// Out-of-range difficulties are never recorded, and never panic.
-	d.issued(-1, time.Now())
-	d.issued(0, time.Now())
-	d.issued(maxTrackedDifficulty+1, time.Now())
-	require.False(t, d.issuedSince(0, time.Time{}))
-	require.False(t, d.issuedSince(maxTrackedDifficulty+1, time.Time{}))
+	d.issued(-1)
+	d.issued(0)
+	d.issued(maxTrackedDifficulty + 1)
+	require.False(t, d.issuedWithin(0, time.Hour))
+	require.False(t, d.issuedWithin(maxTrackedDifficulty+1, time.Hour))
+	require.False(t, d.issuedWithin(8, time.Hour))
+}
+
+// clockedHistory returns a history whose elapsed time the test sets.
+func clockedHistory() (*difficultyHistory, *time.Duration) {
+	el := new(time.Duration)
+	return &difficultyHistory{elapsed: func() time.Duration { return *el }}, el
+}
+
+func TestStaleDifficultyWindowIsTenElapsedMinutes(t *testing.T) {
+	d, el := clockedHistory()
+	*el = time.Minute
+	issuePage(t, handlerAt(8, d))
+	// Just inside ten minutes after the page counts, just past does not.
+	*el = 11*time.Minute - 5*time.Second
+	require.Equal(t, reasonStaleDifficulty, verifyReason(t, handlerAt(12, d), 8, 12))
+	*el = 11*time.Minute + time.Second
+	require.Equal(t, reasonProof, verifyReason(t, handlerAt(12, d), 8, 12))
+
+	// A page at elapsed 0 (process start) is still recorded.
+	start, el0 := clockedHistory()
+	start.issued(8)
+	require.True(t, start.issuedWithin(8, staleDifficultyWindow))
+	*el0 = staleDifficultyWindow + time.Nanosecond
+	require.False(t, start.issuedWithin(8, staleDifficultyWindow))
 }
 
 func TestAlternatingDifficultiesKeepEveryRecentOne(t *testing.T) {
-	d := &difficultyHistory{}
-	t0 := time.Now()
-	d.issued(14, t0)
+	d, el := clockedHistory()
+	d.issued(14)
 	for i := 0; i < 100; i++ { // far more changes than any list would keep
-		d.issued(16+2*(i%2), t0.Add(time.Duration(i)*time.Second))
+		*el = time.Duration(i) * time.Second
+		d.issued(16 + 2*(i%2))
 	}
-	at := t0.Add(2 * time.Minute)
+	*el = 2 * time.Minute
 	for _, diff := range []int{14, 16, 18} {
-		require.True(t, d.issuedSince(diff, at.Add(-staleDifficultyWindow)), diff)
+		require.True(t, d.issuedWithin(diff, staleDifficultyWindow), diff)
 	}
-	require.False(t, d.issuedSince(15, at.Add(-staleDifficultyWindow)))
-	require.False(t, d.issuedSince(14, t0.Add(staleDifficultyWindow+time.Second).Add(-staleDifficultyWindow)))
+	require.False(t, d.issuedWithin(15, staleDifficultyWindow))
+	*el = staleDifficultyWindow + time.Second
+	require.False(t, d.issuedWithin(14, staleDifficultyWindow))
+	require.True(t, d.issuedWithin(18, staleDifficultyWindow))
 }
 
 func startedApp(t *testing.T, diff int) *ChallengeApp {
@@ -170,7 +190,7 @@ func TestRejectedConfigsRecordNoDifficulty(t *testing.T) {
 	require.ErrorContains(t, err, "loading config loader module")
 
 	for diff := 1; diff <= maxTrackedDifficulty; diff++ {
-		require.False(t, processDifficulties.issuedSince(diff, time.Time{}), diff)
+		require.False(t, processDifficulties.issuedWithin(diff, time.Hour), diff)
 	}
 	// The running config keeps issuing pages, so after a real move to 20 its
 	// 16 counts and the rejected 10 and 11 do not.

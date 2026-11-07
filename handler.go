@@ -64,10 +64,9 @@ func (h *ChallengeHandler) history() *difficultyHistory {
 // staleDifficulty reports whether a proof that fails the handler's difficulty
 // meets a lower one that issued a page on this machine during the last
 // staleDifficultyWindow. Only failed proofs pay for it.
-func (h *ChallengeHandler) staleDifficulty(challenge, solution string, now time.Time) bool {
-	since := now.Add(-staleDifficultyWindow)
+func (h *ChallengeHandler) staleDifficulty(challenge, solution string) bool {
 	for d, z := 1, leadingZeroBits(challenge, solution); d <= z && d < h.app.Difficulty(); d++ {
-		if h.history().issuedSince(d, since) {
+		if h.history().issuedWithin(d, staleDifficultyWindow) {
 			return true
 		}
 	}
@@ -148,7 +147,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	now := time.Now()
 	ret := safeReturn(r.URL.RequestURI())
 	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now.Add(challengeTokenTTL))
-	h.history().issued(h.app.Difficulty(), now)
+	h.history().issued(h.app.Difficulty())
 	var fb *fallbackView
 	if h.app.Fallback().Enabled && isLikelyDocument(r) {
 		pol := h.app.PassPolicy()
@@ -182,7 +181,7 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		reason = reasonProof
 		// Solved at a difficulty that issued pages here during the last few
 		// minutes: the page may have been one of them.
-		if h.staleDifficulty(challenge, solution, now) {
+		if h.staleDifficulty(challenge, solution) {
 			reason = reasonStaleDifficulty
 		}
 	case h.replayedSolve(pol, p): // only after the token and proof verify: it spends the solve

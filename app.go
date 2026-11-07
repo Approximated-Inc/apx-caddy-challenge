@@ -260,29 +260,45 @@ const maxTrackedDifficulty = 256
 // issued just before a config reload raised it would otherwise fail its solve
 // as a wrong proof. It follows issued pages, not the app lifecycle, so a
 // config Caddy rejects or rolls back records nothing unless it served a page.
-// Issuing a page costs one atomic store. It lives at process level, like the
-// replay set, so a reload keeps it; a restart forgets it.
+// Times are monotonic offsets from process start, so a wall-clock step never
+// stretches or shortens the window. Issuing a page costs one atomic store. It
+// lives at process level, like the replay set, so a reload keeps it; a restart
+// forgets it.
 type difficultyHistory struct {
-	lastIssued [maxTrackedDifficulty + 1]atomic.Int64 // unix nanoseconds, 0 = never
+	// lastIssued holds the elapsed nanoseconds at the last page, plus one;
+	// 0 means never.
+	lastIssued [maxTrackedDifficulty + 1]atomic.Int64
+	// elapsed is time since processStart unless a test injects a clock.
+	elapsed func() time.Duration
 }
+
+// processStart carries the monotonic clock reading every offset counts from.
+var processStart = time.Now()
 
 var processDifficulties = &difficultyHistory{}
 
-// issued records that a page at difficulty was issued at now.
-func (d *difficultyHistory) issued(difficulty int, now time.Time) {
+func (d *difficultyHistory) now() time.Duration {
+	if d.elapsed != nil {
+		return d.elapsed()
+	}
+	return time.Since(processStart)
+}
+
+// issued records that a page at difficulty was issued now.
+func (d *difficultyHistory) issued(difficulty int) {
 	if difficulty < 1 || difficulty > maxTrackedDifficulty {
 		return
 	}
-	d.lastIssued[difficulty].Store(now.UnixNano())
+	d.lastIssued[difficulty].Store(int64(max(d.now(), 0)) + 1)
 }
 
-// issuedSince reports whether difficulty issued a page at or after since.
-func (d *difficultyHistory) issuedSince(difficulty int, since time.Time) bool {
+// issuedWithin reports whether difficulty issued a page during the last window.
+func (d *difficultyHistory) issuedWithin(difficulty int, window time.Duration) bool {
 	if difficulty < 1 || difficulty > maxTrackedDifficulty {
 		return false
 	}
 	at := d.lastIssued[difficulty].Load()
-	return at != 0 && at >= since.UnixNano()
+	return at != 0 && d.now()-time.Duration(at-1) <= window
 }
 
 var (
