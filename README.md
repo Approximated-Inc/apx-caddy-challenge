@@ -34,6 +34,30 @@ The handler sets the `apx_challenge_outcome` request var
 apx-caddy-stats recorder (Phase 9c). `passed_fallback` appears only when the
 render-check fallback below is on. The fallback pixel request sets no outcome.
 
+Beside every `issued` and `failed` outcome it also sets
+`apx_challenge_reason`, which says what happened. The outcome var keeps its
+five values, because the app's response guard route matches `issued` and the
+stats recorder's request-event disposition reads it. apx-caddy-stats (from
+the version that reads the reason) composes the two into the stored outcome,
+for example `issued_document` or `failed_proof`; an older recorder ignores
+the reason.
+
+| Outcome | Reason | When |
+|---|---|---|
+| `issued` | `document` | Page served to a request that is not HEAD and has `Sec-Fetch-Dest: document` or an `Accept` containing `text/html` (the fallback's document test) |
+| `issued` | `other` | Page served to anything else: HEAD, `Accept: */*`, subresources |
+| `failed` | `api` | 429 to a likely API client: no page shown |
+| `failed` | `stream` | 503 to WebSocket or SSE: no page shown |
+| `failed` | `token` | Verify: token missing, malformed or not signed by this cluster (also the fallback token) |
+| `failed` | `expired` | Verify: authentic token past its life (5 minutes, or 10 for the fallback token) |
+| `failed` | `binding` | Verify: authentic, unexpired token issued to another client prefix or, under `pass_bind_user_agent`, another UA |
+| `failed` | `proof` | Verify: valid token, wrong proof-of-work |
+| `failed` | `replay` | Verify: valid solve already spent on this machine (non-default pass policy only), or a spent fallback nonce |
+| `failed` | `render` | Fallback POST without the fallback cookie, without the pixel load, or before the dwell |
+| `failed` | `fallback_limit` | Fallback POST over the prefix's hourly budget |
+
+Passes (`passed`, `passed_fallback`, `passed_recently`) set no reason.
+
 ## Config (emitted by Phoenix — not hand-written)
 
     "apps": { "apx_challenge": {
@@ -334,6 +358,6 @@ and its failure, the pixel endpoint and what counts as a render, concurrent
 replays, the stores, the non-rolling cookie, the opt-out, a golden test that
 the opted-out page is byte-identical to the pre-fallback page, and a golden of
 the default page), the handler (serve/verify/cookie-gate/non-browser/outcome
-var), and page rendering. The real browser solve-and-redirect (incl. slow network +
+var, and the reason beside each issued and failed outcome), and page rendering. The real browser solve-and-redirect (incl. slow network +
 budget mobile to validate difficulty-16 solve time) is verified on the canary,
 not in CI.
