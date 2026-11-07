@@ -290,7 +290,8 @@ func TestSolveAtThePreviousDifficultyIsStaleDifficulty(t *testing.T) {
 	tok := IssueChallenge("h-secret", "203.0.113.5", "/", time.Now().Add(challengeTokenTTL))
 	form := url.Values{"challenge": {tok}, "solution": {solutionBetween(tok, 8, 12)}}
 
-	raised := &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 12, vp: "/__apx_challenge/verify", prev: 8}}
+	// Raised 8 -> 10 -> 12 within the window: every difficulty in force counts.
+	raised := &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 12, vp: "/__apx_challenge/verify", prev: []int{10, 8}}}
 	r := verifyReq(form, "203.0.113.5", "UA")
 	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
 	_, reason := outcomeAndReason(r)
@@ -303,30 +304,70 @@ func TestSolveAtThePreviousDifficultyIsStaleDifficulty(t *testing.T) {
 	_, reason = outcomeAndReason(r)
 	require.Equal(t, reasonProof, reason)
 
-	// A proof that meets neither is a wrong proof even right after a change.
+	// A proof that meets none of them is a wrong proof even right after a change.
 	r = verifyReq(url.Values{"challenge": {tok}, "solution": {failingSolution(tok, 8)}}, "203.0.113.5", "UA")
 	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
 	_, reason = outcomeAndReason(r)
 	require.Equal(t, reasonProof, reason)
 }
 
-func TestDifficultyHistory(t *testing.T) {
+func TestDifficultyHistoryKeepsEveryDifficultyInTheWindow(t *testing.T) {
 	d := &difficultyHistory{}
 	now := time.Now()
 	d.record(16, now)
 	d.record(16, now) // a reload with the same difficulty is no change
-	require.Equal(t, 0, d.previousAt(now))
-	d.record(18, now)
-	require.Equal(t, 16, d.previousAt(now.Add(staleDifficultyWindow)))
-	require.Equal(t, 0, d.previousAt(now.Add(staleDifficultyWindow+time.Second)))
+	require.Empty(t, d.replacedSince(now.Add(-staleDifficultyWindow)))
 
-	// Provision records each config's difficulty.
-	h := &difficultyHistory{}
-	for _, diff := range []int{14, 20} {
-		app := &ChallengeApp{SecretCfg: "s", DifficultyCfg: diff, difficulties: h}
-		require.NoError(t, app.Provision(caddy.Context{}))
+	// 16 -> 18 -> 20 within five minutes: both earlier ones are remembered.
+	d.record(18, now.Add(time.Minute))
+	d.record(20, now.Add(2*time.Minute))
+	at := now.Add(3 * time.Minute)
+	require.ElementsMatch(t, []int{16, 18}, d.replacedSince(at.Add(-staleDifficultyWindow)))
+
+	// 16 stopped at +1m: forgotten once that is more than the window ago.
+	later := now.Add(time.Minute + staleDifficultyWindow + time.Second)
+	require.ElementsMatch(t, []int{18}, d.replacedSince(later.Add(-staleDifficultyWindow)))
+
+	// Back to 16: the current difficulty is never listed.
+	d.record(16, now.Add(4*time.Minute))
+	require.ElementsMatch(t, []int{18, 20}, d.replacedSince(now.Add(4*time.Minute).Add(-staleDifficultyWindow)))
+}
+
+func TestDifficultyHistoryIsBounded(t *testing.T) {
+	d := &difficultyHistory{}
+	now := time.Now()
+	for i := 0; i < 3*maxDifficultyHistory; i++ {
+		d.record(10+i, now)
 	}
-	app := &ChallengeApp{SecretCfg: "s", DifficultyCfg: 20, difficulties: h}
-	require.NoError(t, app.Provision(caddy.Context{}))
-	require.Equal(t, 14, app.PreviousDifficulty(time.Now()))
+	require.Len(t, d.replacedSince(now.Add(-time.Minute)), maxDifficultyHistory)
+
+	// Entries older than the window are dropped, not just hidden.
+	old := &difficultyHistory{}
+	old.record(10, now)
+	old.record(11, now)
+	old.record(12, now.Add(staleDifficultyWindow+2*time.Second))
+	require.Equal(t, []replacedDifficulty{{difficulty: 11, until: now.Add(staleDifficultyWindow + 2*time.Second)}}, old.replaced)
+}
+
+func TestDifficultyIsRecordedOnlyWhenTheConfigStarts(t *testing.T) {
+	h := &difficultyHistory{}
+	start := func(cfg *ChallengeApp) error {
+		cfg.difficulties = h
+		if err := cfg.Provision(caddy.Context{}); err != nil {
+			return err
+		}
+		return cfg.Start()
+	}
+	require.NoError(t, start(&ChallengeApp{SecretCfg: "s", DifficultyCfg: 16}))
+	require.NoError(t, start(&ChallengeApp{SecretCfg: "s", DifficultyCfg: 20}))
+
+	// A config rejected at Provision never reaches Start, and changes nothing.
+	require.Error(t, start(&ChallengeApp{SecretCfg: "s", DifficultyCfg: 18, PassIdleTTLSecondsCfg: 1}))
+	// Provisioned but never started (Caddy rejected the config elsewhere): nothing either.
+	unstarted := &ChallengeApp{SecretCfg: "s", DifficultyCfg: 22, difficulties: h}
+	require.NoError(t, unstarted.Provision(caddy.Context{}))
+
+	live := &ChallengeApp{SecretCfg: "s", DifficultyCfg: 20, difficulties: h}
+	require.NoError(t, live.Provision(caddy.Context{}))
+	require.Equal(t, []int{16}, live.PreviousDifficulties(time.Now()))
 }

@@ -157,10 +157,13 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	case reason != "":
 	case !VerifyPoW(challenge, solution, h.app.Difficulty()):
 		reason = reasonProof
-		// Solved at the difficulty in force before a recent change: the page was
-		// issued with it, so the visitor did nothing wrong.
-		if prev := h.app.PreviousDifficulty(now); prev > 0 && VerifyPoW(challenge, solution, prev) {
-			reason = reasonStaleDifficulty
+		// Solved at a difficulty in force during the last few minutes: the
+		// page may have been issued with it, so the visitor did nothing wrong.
+		for _, prev := range h.app.PreviousDifficulties(now) {
+			if VerifyPoW(challenge, solution, prev) {
+				reason = reasonStaleDifficulty
+				break
+			}
 		}
 	case h.replayedSolve(pol, p): // only after the token and proof verify: it spends the solve
 		reason = reasonReplay

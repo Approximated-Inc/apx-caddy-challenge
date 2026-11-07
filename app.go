@@ -36,9 +36,9 @@ type AppRef interface {
 	Fallback() FallbackConfig
 	// FallbackState is the process-wide rendered-nonce set and pass budget.
 	FallbackState() *FallbackState
-	// PreviousDifficulty is the PoW difficulty in force before the last
-	// change, while a page issued under it may still be verified; else 0.
-	PreviousDifficulty(now time.Time) int
+	// PreviousDifficulties are the PoW difficulties, other than the current
+	// one, in force while a page issued under them may still be verified.
+	PreviousDifficulties(now time.Time) []int
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -152,7 +152,6 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.difficulties == nil {
 		a.difficulties = processDifficulties
 	}
-	a.difficulties.record(a.difficulty, time.Now())
 
 	if a.verifyDifficulty = a.VerifyDifficultyCfg; a.verifyDifficulty <= 0 {
 		a.verifyDifficulty = 14
@@ -239,8 +238,13 @@ func buildPassPolicy(idleS, maxS, v4, v6 int, bindUA bool) (PassPolicy, error) {
 	return pol, nil
 }
 
-func (a *ChallengeApp) Start() error { return nil }
-func (a *ChallengeApp) Stop() error  { return nil }
+// Start records the difficulty as in force: Caddy starts apps only after the
+// whole config provisioned and validated, so a rejected config never does.
+func (a *ChallengeApp) Start() error {
+	a.difficulties.record(a.difficulty, time.Now())
+	return nil
+}
+func (a *ChallengeApp) Stop() error { return nil }
 
 func (a *ChallengeApp) Secret() string     { return a.secret }
 func (a *ChallengeApp) Difficulty() int    { return a.difficulty }
@@ -255,45 +259,75 @@ func (a *ChallengeApp) PassPolicy() PassPolicy        { return a.passPolicy }
 func (a *ChallengeApp) Fallback() FallbackConfig      { return a.fallback }
 func (a *ChallengeApp) FallbackState() *FallbackState { return processFallbackState }
 
-func (a *ChallengeApp) PreviousDifficulty(now time.Time) int {
-	return a.difficulties.previousAt(now)
+func (a *ChallengeApp) PreviousDifficulties(now time.Time) []int {
+	if a.difficulties == nil {
+		return nil
+	}
+	return a.difficulties.replacedSince(now.Add(-staleDifficultyWindow))
 }
 
-// staleDifficultyWindow is how long after a difficulty change a solve at the
-// previous difficulty is still recognised: the challenge token's life plus
-// time for the config to reach every machine.
+// staleDifficultyWindow is how long after a difficulty stops being in force a
+// solve at it is still recognised: the challenge token's life plus time for
+// the config to reach every machine.
 const staleDifficultyWindow = 2 * challengeTokenTTL
 
-// difficultyHistory remembers the PoW difficulty in force before the last
-// change on this machine. Challenge tokens do not carry their difficulty (the
-// default-policy token is byte-identical to the original format), so a page
-// issued just before a config reload raised it would otherwise fail its solve
-// as a wrong proof. It lives at process level, like the replay set, so a
-// reload keeps it.
+// maxDifficultyHistory bounds the replaced difficulties kept; a burst of
+// reloads inside the window keeps the most recent ones.
+const maxDifficultyHistory = 32
+
+// difficultyHistory remembers every PoW difficulty that was in force on this
+// machine during the last staleDifficultyWindow. Challenge tokens do not
+// carry their difficulty (the default-policy token is byte-identical to the
+// original format), so a page issued just before a config reload raised it
+// would otherwise fail its solve as a wrong proof. It lives at process level,
+// like the replay set, so a reload keeps it; a restart forgets it.
 type difficultyHistory struct {
-	mu                sync.Mutex
-	current, previous int
-	changedAt         time.Time
+	mu       sync.Mutex
+	current  int
+	replaced []replacedDifficulty
+}
+
+// replacedDifficulty is a difficulty that was in force until until.
+type replacedDifficulty struct {
+	difficulty int
+	until      time.Time
 }
 
 var processDifficulties = &difficultyHistory{}
 
+// record makes difficulty the one in force from now. Called from Start, so a
+// config that fails to load never reaches it.
 func (d *difficultyHistory) record(difficulty int, now time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.current != 0 && d.current != difficulty {
-		d.previous, d.changedAt = d.current, now
+		d.replaced = append(d.replaced, replacedDifficulty{difficulty: d.current, until: now})
 	}
 	d.current = difficulty
+	keep := d.replaced[:0]
+	for _, r := range d.replaced {
+		if now.Sub(r.until) <= staleDifficultyWindow {
+			keep = append(keep, r)
+		}
+	}
+	if len(keep) > maxDifficultyHistory {
+		keep = keep[len(keep)-maxDifficultyHistory:]
+	}
+	d.replaced = keep
 }
 
-func (d *difficultyHistory) previousAt(now time.Time) int {
+// replacedSince returns the difficulties, other than the current one, that
+// were in force at or after since.
+func (d *difficultyHistory) replacedSince(since time.Time) []int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.previous == 0 || now.Sub(d.changedAt) > staleDifficultyWindow {
-		return 0
+	var out []int
+	for _, r := range d.replaced {
+		if !r.until.Before(since) && r.difficulty != d.current {
+			out = append(out, r.difficulty)
+		}
 	}
-	return d.previous
+	return out
 }
 
 var (

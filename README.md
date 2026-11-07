@@ -52,7 +52,7 @@ the reason.
 | `failed` | `expired` | Verify: authentic token past its life (5 minutes, or 10 for the fallback token) |
 | `failed` | `binding` | Verify: authentic, unexpired token issued to another client prefix or, under `pass_bind_user_agent`, another UA |
 | `failed` | `proof` | Verify: valid token, wrong proof-of-work |
-| `failed` | `stale_difficulty` | Verify: the proof meets the difficulty in force before a change on this machine in the last 10 minutes, not the current one (tokens do not carry their difficulty) |
+| `failed` | `stale_difficulty` | Verify: the proof fails the current difficulty but meets one that was in force on this machine during the last 10 minutes (tokens do not carry their difficulty) |
 | `failed` | `replay` | Verify: valid proof-of-work solve already spent on this machine (non-default pass policy only) |
 | `failed` | `render_cookie` | Fallback POST without a fallback cookie naming its nonce (for example a fifth tab pushed it out) |
 | `failed` | `render_pixel` | Fallback POST whose pixel was not loaded on this machine (or was loaded on another one) |
@@ -65,6 +65,19 @@ Other passes set no reason. A pass cookie earned through the fallback carries
 `"f":true` in its signed body, kept across rolling renewal. Older images
 ignore the key and accept the cookie; cookies without it, including every
 cookie minted by an older image, are treated as solved.
+
+Known limits:
+
+- **Mixed images.** A fallback cookie minted by an older machine has no `f`, so
+  a newer machine records it as a solved `passed_recently`, and an older
+  machine records a newer machine's fallback cookie the same way. Fallback
+  cookies last `fallback_pass_ttl_seconds` (300 s by default), so this lasts
+  at most that long per cookie, and only while a cluster runs both images.
+- **Difficulty after a restart.** The difficulties in force during the last 10
+  minutes are kept per process, recorded when the config starts (a config
+  rejected at load never records its difficulty), and survive reloads. A
+  restart forgets them: a page issued before a restart that also raised the
+  difficulty records `proof`, not `stale_difficulty`.
 
 ## Config (emitted by Phoenix — not hand-written)
 
