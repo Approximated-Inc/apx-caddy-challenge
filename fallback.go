@@ -170,14 +170,14 @@ func verifyFallbackToken(secret string, pol PassPolicy, token, ip, ua string, no
 		return fallbackPayload{}, errInvalid
 	}
 	if now.Unix() > p.Exp {
-		return fallbackPayload{}, errInvalid
+		return fallbackPayload{}, errExpired
 	}
 	pref, ok := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	if !ok || p.Prefix != pref {
-		return fallbackPayload{}, errInvalid
+		return fallbackPayload{}, errBinding
 	}
 	if pol.BindUserAgent && !hmac.Equal([]byte(p.UA), []byte(uaHash(ua))) {
-		return fallbackPayload{}, errInvalid
+		return fallbackPayload{}, errBinding
 	}
 	return p, nil
 }
@@ -387,18 +387,39 @@ func (h *ChallengeHandler) fallbackFailure(r *http.Request, p fallbackPayload, n
 	return ""
 }
 
+// fallbackFailureReason maps a fallbackFailure result to the reason recorded
+// with the failed outcome: a missing cookie, a missing render or a POST before
+// the dwell is a failed render check; a spent nonce is a replay; the hourly
+// budget is its own, neutral, reason.
+func fallbackFailureReason(failure string) string {
+	switch failure {
+	case "":
+		return ""
+	case "replayed":
+		return reasonReplay
+	case "rate_limited":
+		return reasonFallbackLimit
+	default:
+		return reasonRender
+	}
+}
+
 // handleFallbackVerify checks a fallback form POST. A pass gets a
 // non-rolling pass cookie with the fallback TTL; a failure takes the same
 // path as a failed solve.
 func (h *ChallengeHandler) handleFallbackVerify(w http.ResponseWriter, r *http.Request, ip string) error {
 	pol, now := h.app.PassPolicy(), time.Now()
 	p, err := verifyFallbackToken(h.app.Secret(), pol, r.FormValue("fallback"), ip, r.UserAgent(), now)
-	if err != nil || h.fallbackFailure(r, p, now) != "" {
+	reason := tokenFailureReason(err)
+	if err == nil {
+		reason = fallbackFailureReason(h.fallbackFailure(r, p, now))
+	}
+	if reason != "" {
 		ret := safeReturn(r.FormValue("ret"))
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		return h.verifyFailed(w, r, ret)
+		return h.verifyFailed(w, r, ret, reason)
 	}
 	fpol := pol
 	fpol.IdleTTL, fpol.MaxTTL = h.app.Fallback().PassTTL, h.app.Fallback().PassTTL

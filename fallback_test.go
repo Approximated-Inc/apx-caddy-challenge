@@ -418,6 +418,22 @@ func TestFallbackFailures(t *testing.T) {
 			return fbPost(fbIP, fbUA, backdate(t, app, p.token, fbIP, fbUA, 3*time.Second), "/r", p.cookie)
 		}},
 	}
+	// The reason recorded beside the failed outcome, per case.
+	reasons := map[string]string{
+		"missing cookie":            reasonRender,
+		"cookie for another nonce":  reasonRender,
+		"forged cookie":             reasonRender,
+		"pixel not rendered":        reasonRender,
+		"too fast":                  reasonRender,
+		"dwell is configurable":     reasonRender,
+		"replayed nonce":            reasonReplay,
+		"other prefix":              reasonBinding,
+		"other UA under UA binding": reasonBinding,
+		"expired token":             reasonExpired,
+		"fallback payload signed under another label": reasonToken,
+		"rate limit": reasonFallbackLimit,
+	}
+	require.Len(t, reasons, len(cases))
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fb := enabledFallback()
@@ -428,6 +444,7 @@ func TestFallbackFailures(t *testing.T) {
 			r := tc.run(t, h, app)
 			w := postFallback(t, h, r)
 			requireFailed(t, w, r, "/r")
+			require.Equal(t, reasons[tc.name], caddyhttp.GetVar(r.Context(), reasonVarKey))
 		})
 	}
 }

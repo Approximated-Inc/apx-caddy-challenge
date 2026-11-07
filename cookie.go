@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -110,6 +111,14 @@ func (pol PassPolicy) Renewal(c PassCookie, now time.Time) (time.Time, bool) {
 }
 
 var errInvalid = errors.New("apx_challenge: invalid or expired token")
+
+// errExpired and errBinding wrap errInvalid for an authentic token that is
+// past its life, or that was issued to another client prefix or UA. They let
+// the handler record why a verify failed; errors.Is(err, errInvalid) still holds.
+var (
+	errExpired = fmt.Errorf("%w: expired", errInvalid)
+	errBinding = fmt.Errorf("%w: issued to another client", errInvalid)
+)
 
 // clientPrefix returns the /24 (v4) or /64 (v6) network of ip as a string.
 // The bool is false when ip is unparseable, so callers can reject rather than
@@ -220,14 +229,14 @@ func VerifyPassChallenge(secret string, pol PassPolicy, token, ip, ua string, no
 		return ChallengePayload{}, errInvalid
 	}
 	if now.Unix() > p.Exp {
-		return ChallengePayload{}, errInvalid
+		return ChallengePayload{}, errExpired
 	}
 	pref, ok := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	if !ok || p.Prefix != pref {
-		return ChallengePayload{}, errInvalid
+		return ChallengePayload{}, errBinding
 	}
 	if pol.BindUserAgent && !hmac.Equal([]byte(p.UA), []byte(uaHash(ua))) {
-		return ChallengePayload{}, errInvalid
+		return ChallengePayload{}, errBinding
 	}
 	return p, nil
 }
