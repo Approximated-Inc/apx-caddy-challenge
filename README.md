@@ -44,19 +44,27 @@ the reason.
 
 | Outcome | Reason | When |
 |---|---|---|
-| `issued` | `document` | Page served to a request that is not HEAD and has `Sec-Fetch-Dest: document` or an `Accept` containing `text/html` (the fallback's document test) |
-| `issued` | `other` | Page served to anything else: HEAD, `Accept: */*`, subresources |
+| `issued` | `document` | Page served to a request that is not HEAD, not a prefetch, and has `Sec-Fetch-Dest: document` or an `Accept` containing `text/html` (the fallback's document test) |
+| `issued` | `other` | Page served to anything else: HEAD, `Accept: */*`, subresources, prefetches (`Sec-Purpose: prefetch`, `Purpose: prefetch`) |
 | `failed` | `api` | 429 to a likely API client: no page shown |
 | `failed` | `stream` | 503 to WebSocket or SSE: no page shown |
 | `failed` | `token` | Verify: token missing, malformed or not signed by this cluster (also the fallback token) |
 | `failed` | `expired` | Verify: authentic token past its life (5 minutes, or 10 for the fallback token) |
 | `failed` | `binding` | Verify: authentic, unexpired token issued to another client prefix or, under `pass_bind_user_agent`, another UA |
 | `failed` | `proof` | Verify: valid token, wrong proof-of-work |
-| `failed` | `replay` | Verify: valid solve already spent on this machine (non-default pass policy only), or a spent fallback nonce |
-| `failed` | `render` | Fallback POST without the fallback cookie, without the pixel load, or before the dwell |
+| `failed` | `stale_difficulty` | Verify: the proof meets the difficulty in force before a change on this machine in the last 10 minutes, not the current one (tokens do not carry their difficulty) |
+| `failed` | `replay` | Verify: valid proof-of-work solve already spent on this machine (non-default pass policy only) |
+| `failed` | `render_cookie` | Fallback POST without a fallback cookie naming its nonce (for example a fifth tab pushed it out) |
+| `failed` | `render_pixel` | Fallback POST whose pixel was not loaded on this machine (or was loaded on another one) |
+| `failed` | `render_dwell` | Fallback POST before the minimum dwell |
+| `failed` | `fallback_replay` | Fallback nonce already spent (for example a double-clicked Continue) |
 | `failed` | `fallback_limit` | Fallback POST over the prefix's hourly budget |
+| `passed_recently` | `fallback` | The pass cookie was earned through the render-check fallback |
 
-Passes (`passed`, `passed_fallback`, `passed_recently`) set no reason.
+Other passes set no reason. A pass cookie earned through the fallback carries
+`"f":true` in its signed body, kept across rolling renewal. Older images
+ignore the key and accept the cookie; cookies without it, including every
+cookie minted by an older image, are treated as solved.
 
 ## Config (emitted by Phoenix — not hand-written)
 

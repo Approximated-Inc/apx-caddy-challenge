@@ -420,13 +420,13 @@ func TestFallbackFailures(t *testing.T) {
 	}
 	// The reason recorded beside the failed outcome, per case.
 	reasons := map[string]string{
-		"missing cookie":            reasonRender,
-		"cookie for another nonce":  reasonRender,
-		"forged cookie":             reasonRender,
-		"pixel not rendered":        reasonRender,
-		"too fast":                  reasonRender,
-		"dwell is configurable":     reasonRender,
-		"replayed nonce":            reasonReplay,
+		"missing cookie":            reasonRenderCookie,
+		"cookie for another nonce":  reasonRenderCookie,
+		"forged cookie":             reasonRenderCookie,
+		"pixel not rendered":        reasonRenderPixel,
+		"too fast":                  reasonRenderDwell,
+		"dwell is configurable":     reasonRenderDwell,
+		"replayed nonce":            reasonFallbackReplay,
 		"other prefix":              reasonBinding,
 		"other UA under UA binding": reasonBinding,
 		"expired token":             reasonExpired,

@@ -18,17 +18,18 @@ import (
 // PoW solve in-test is instant.
 type verifyTestApp struct{}
 
-func (verifyTestApp) Secret() string                { return "s" }
-func (verifyTestApp) Difficulty() int               { return 8 }
-func (verifyTestApp) VerifyPath() string            { return "/__apx_challenge/verify" }
-func (verifyTestApp) VerifyDifficulty() int         { return 4 }
-func (verifyTestApp) VerifyTokenTTL() time.Duration { return 600 * time.Second }
-func (verifyTestApp) VerifyScoring() string         { return "off" }
-func (verifyTestApp) VerifyBodyCap() int64          { return 1 << 20 }
-func (verifyTestApp) ReplayLRU() *NonceLRU          { return NewNonceLRU(1024) }
-func (verifyTestApp) PassPolicy() PassPolicy        { return DefaultPassPolicy() }
-func (verifyTestApp) Fallback() FallbackConfig      { return FallbackConfig{} }
-func (verifyTestApp) FallbackState() *FallbackState { return NewFallbackState(1024) }
+func (verifyTestApp) Secret() string                   { return "s" }
+func (verifyTestApp) Difficulty() int                  { return 8 }
+func (verifyTestApp) VerifyPath() string               { return "/__apx_challenge/verify" }
+func (verifyTestApp) VerifyDifficulty() int            { return 4 }
+func (verifyTestApp) VerifyTokenTTL() time.Duration    { return 600 * time.Second }
+func (verifyTestApp) VerifyScoring() string            { return "off" }
+func (verifyTestApp) VerifyBodyCap() int64             { return 1 << 20 }
+func (verifyTestApp) ReplayLRU() *NonceLRU             { return NewNonceLRU(1024) }
+func (verifyTestApp) PassPolicy() PassPolicy           { return DefaultPassPolicy() }
+func (verifyTestApp) Fallback() FallbackConfig         { return FallbackConfig{} }
+func (verifyTestApp) FallbackState() *FallbackState    { return NewFallbackState(1024) }
+func (verifyTestApp) PreviousDifficulty(time.Time) int { return 0 }
 
 func newFakeApp() AppRef { return verifyTestApp{} }
 

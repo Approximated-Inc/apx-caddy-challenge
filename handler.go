@@ -27,17 +27,22 @@ const (
 // not_shown_api, failed_proof, ...). The outcome var itself keeps its five
 // values, which the response guard route and request-event dispositions match.
 const (
-	reasonDocument      = "document"       // issued: page served to a likely displayed document
-	reasonOther         = "other"          // issued: page served to anything else (HEAD, subresource, */*)
-	reasonAPI           = "api"            // failed: 429, no page shown to a likely API client
-	reasonStream        = "stream"         // failed: 503, no page shown to WebSocket or SSE
-	reasonToken         = "token"          // failed: token missing, malformed or forged
-	reasonExpired       = "expired"        // failed: authentic token past its life
-	reasonBinding       = "binding"        // failed: authentic token for another client prefix or UA
-	reasonProof         = "proof"          // failed: valid token, wrong proof-of-work
-	reasonReplay        = "replay"         // failed: valid solve or fallback nonce already spent
-	reasonRender        = "render"         // failed: fallback POST without the cookie, the render or the dwell
-	reasonFallbackLimit = "fallback_limit" // failed: fallback budget for the prefix used up
+	reasonDocument        = "document"         // issued: page served to a likely displayed document
+	reasonOther           = "other"            // issued: page served to anything else (HEAD, subresource, */*)
+	reasonAPI             = "api"              // failed: 429, no page shown to a likely API client
+	reasonStream          = "stream"           // failed: 503, no page shown to WebSocket or SSE
+	reasonToken           = "token"            // failed: token missing, malformed or forged
+	reasonExpired         = "expired"          // failed: authentic token past its life
+	reasonBinding         = "binding"          // failed: authentic token for another client prefix or UA
+	reasonProof           = "proof"            // failed: valid token, wrong proof-of-work
+	reasonStaleDifficulty = "stale_difficulty" // failed: proof meets the difficulty before a recent change, not the current one
+	reasonReplay          = "replay"           // failed: valid proof-of-work solve already spent
+	reasonRenderCookie    = "render_cookie"    // failed: fallback POST without the fallback cookie naming its nonce
+	reasonRenderPixel     = "render_pixel"     // failed: fallback POST whose pixel was not loaded on this machine
+	reasonRenderDwell     = "render_dwell"     // failed: fallback POST before the minimum dwell
+	reasonFallbackReplay  = "fallback_replay"  // failed: fallback nonce already spent (a double-clicked Continue)
+	reasonFallbackLimit   = "fallback_limit"   // failed: fallback budget for the prefix used up
+	reasonFallback        = "fallback"         // passed_recently: the pass cookie was earned through the fallback
 )
 
 // ChallengeHandler serves the PoW challenge / verifies solutions. Invoked by the
@@ -86,9 +91,13 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		pol, now := h.app.PassPolicy(), time.Now()
 		if pc, ok := VerifyPassCookie(h.app.Secret(), pol, c.Value, ip, r.UserAgent(), now); ok {
 			if exp, renew := pol.Renewal(pc, now); renew {
-				setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp), exp, now)
+				setPassCookie(w, issuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp, pc.Fallback), exp, now)
 			}
-			setOutcome(r, "passed_recently")
+			if pc.Fallback {
+				setOutcomeReason(r, "passed_recently", reasonFallback)
+			} else {
+				setOutcome(r, "passed_recently")
+			}
 			clearTriesCookie(w, r) // apx-challenge-failure-states: pass cookie works, reset the loop breaker
 			// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
 			return next.ServeHTTP(w, r)
@@ -109,7 +118,7 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 		return nil
 	}
 
-	if r.Method != http.MethodHead && isLikelyDocument(r) {
+	if r.Method != http.MethodHead && isLikelyDocument(r) && !isPrefetch(r) {
 		setOutcomeReason(r, "issued", reasonDocument)
 	} else {
 		setOutcomeReason(r, "issued", reasonOther)
@@ -148,6 +157,11 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	case reason != "":
 	case !VerifyPoW(challenge, solution, h.app.Difficulty()):
 		reason = reasonProof
+		// Solved at the difficulty in force before a recent change: the page was
+		// issued with it, so the visitor did nothing wrong.
+		if prev := h.app.PreviousDifficulty(now); prev > 0 && VerifyPoW(challenge, solution, prev) {
+			reason = reasonStaleDifficulty
+		}
 	case h.replayedSolve(pol, p): // only after the token and proof verify: it spends the solve
 		reason = reasonReplay
 	}
@@ -309,6 +323,13 @@ func safeReturn(ret string) string {
 		}
 	}
 	return ret
+}
+
+// isPrefetch reports a speculative fetch (Sec-Purpose: prefetch, possibly
+// with prerender, or the older Purpose: prefetch) that the visitor may never see.
+func isPrefetch(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Sec-Purpose")), "prefetch") ||
+		strings.EqualFold(r.Header.Get("Purpose"), "prefetch")
 }
 
 func isWebSocketOrSSE(r *http.Request) bool {

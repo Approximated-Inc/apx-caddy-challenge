@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/stretchr/testify/require"
 )
@@ -156,4 +158,175 @@ func TestTokenErrorsStillWrapInvalid(t *testing.T) {
 	require.Equal(t, reasonToken, tokenFailureReason(errInvalid))
 	require.Equal(t, reasonExpired, tokenFailureReason(errExpired))
 	require.Equal(t, reasonBinding, tokenFailureReason(errBinding))
+}
+
+// Fallback failures with an ordinary browser cause get their own, neutral,
+// reasons (review reproductions).
+func TestFallbackDoubleSubmitIsFallbackReplay(t *testing.T) {
+	fb := enabledFallback()
+	fb.MinDwell = time.Millisecond
+	h, _ := fbHandler(DefaultPassPolicy(), fb)
+	p := issue(t, h, fbIP, fbUA, "/page")
+	require.Equal(t, 200, fetchPixel(t, h, p.pixel, fbIP).Code)
+	time.Sleep(5 * time.Millisecond)
+
+	first := fbPost(fbIP, fbUA, p.token, "/page", p.cookie)
+	postFallback(t, h, first)
+	require.Equal(t, "passed_fallback", outcomeOf(first))
+
+	second := fbPost(fbIP, fbUA, p.token, "/page", p.cookie)
+	postFallback(t, h, second)
+	outcome, reason := outcomeAndReason(second)
+	require.Equal(t, "failed", outcome)
+	require.Equal(t, reasonFallbackReplay, reason)
+}
+
+func TestFallbackPixelOnAnotherMachineIsRenderPixel(t *testing.T) {
+	fb := enabledFallback()
+	fb.MinDwell = time.Millisecond
+	a, _ := fbHandler(DefaultPassPolicy(), fb)
+	b, _ := fbHandler(DefaultPassPolicy(), fb) // same secret, its own state
+	p := issue(t, a, fbIP, fbUA, "/page")
+	require.Equal(t, 200, fetchPixel(t, a, p.pixel, fbIP).Code)
+	time.Sleep(5 * time.Millisecond)
+
+	r := fbPost(fbIP, fbUA, p.token, "/page", p.cookie)
+	postFallback(t, b, r)
+	_, reason := outcomeAndReason(r)
+	require.Equal(t, reasonRenderPixel, reason)
+}
+
+func TestFallbackFifthTabIsRenderCookie(t *testing.T) {
+	fb := enabledFallback()
+	fb.MinDwell = time.Millisecond
+	h, _ := fbHandler(DefaultPassPolicy(), fb)
+	first := issue(t, h, fbIP, fbUA, "/1")
+	require.Equal(t, 200, fetchPixel(t, h, first.pixel, fbIP).Code)
+	cookie := first.cookie
+	for i := 0; i < fallbackCookieNonces; i++ {
+		r := fbGet("/n", fbIP, fbUA)
+		r.AddCookie(cookie)
+		cookie = respCookie(serveReq(t, h, r), fallbackCookieName)
+	}
+	time.Sleep(5 * time.Millisecond)
+	r := fbPost(fbIP, fbUA, first.token, "/1", cookie)
+	postFallback(t, h, r)
+	_, reason := outcomeAndReason(r)
+	require.Equal(t, reasonRenderCookie, reason)
+}
+
+func TestFallbackCookieSaysSoOnLaterRequests(t *testing.T) {
+	fb := enabledFallback()
+	fb.MinDwell = time.Millisecond
+	h, _ := fbHandler(DefaultPassPolicy(), fb)
+	p := issue(t, h, fbIP, fbUA, "/page")
+	require.Equal(t, 200, fetchPixel(t, h, p.pixel, fbIP).Code)
+	time.Sleep(5 * time.Millisecond)
+	w := postFallback(t, h, fbPost(fbIP, fbUA, p.token, "/page", p.cookie))
+	pass := respCookie(w, CookieName)
+	require.NotNil(t, pass)
+
+	later := fbGet("/page", fbIP, fbUA)
+	later.AddCookie(pass)
+	require.Equal(t, "UPSTREAM", serveReq(t, h, later).Body.String())
+	outcome, reason := outcomeAndReason(later)
+	require.Equal(t, "passed_recently", outcome)
+	require.Equal(t, reasonFallback, reason)
+
+	// A solved cookie, and any cookie from an older image (no "f"), stays a plain pass.
+	solved := fbGet("/page", fbIP, fbUA)
+	solved.AddCookie(&http.Cookie{Name: CookieName, Value: IssueCookie(fbSecret, fbIP, timeNowPlus10())})
+	require.Equal(t, "UPSTREAM", serveReq(t, h, solved).Body.String())
+	outcome, reason = outcomeAndReason(solved)
+	require.Equal(t, "passed_recently", outcome)
+	require.Nil(t, reason)
+}
+
+func TestRollingRenewalKeepsFallbackProvenance(t *testing.T) {
+	pol := DefaultPassPolicy()
+	pol.MaxTTL = 4 * time.Hour
+	now := time.Now()
+	c := issuePassCookie("h-secret", pol, "203.0.113.5", "", now.Add(-time.Hour), now.Add(60*time.Second), true)
+	r := browserReq("/x")
+	r.AddCookie(&http.Cookie{Name: CookieName, Value: c})
+	w := serveReq(t, policyHandler(pol), r)
+	renewed := passCookieHeader(t, w)
+	require.NotNil(t, renewed, "due for renewal")
+	pc, ok := VerifyPassCookie("h-secret", pol, renewed.Value, "203.0.113.5", "", time.Now())
+	require.True(t, ok)
+	require.True(t, pc.Fallback)
+}
+
+func TestPrefetchIsIssuedOther(t *testing.T) {
+	for _, hdr := range []map[string]string{
+		{"Sec-Purpose": "prefetch"},
+		{"Sec-Purpose": "prefetch;prerender"},
+		{"Purpose": "prefetch"},
+	} {
+		r := browserReq("/next")
+		r.Header.Set("Sec-Fetch-Dest", "document")
+		r.Header.Set("Sec-Fetch-Mode", "navigate")
+		for k, v := range hdr {
+			r.Header.Set(k, v)
+		}
+		require.Equal(t, http.StatusOK, serveReq(t, newHandler(), r).Code)
+		outcome, reason := outcomeAndReason(r)
+		require.Equal(t, "issued", outcome)
+		require.Equal(t, reasonOther, reason, "%v", hdr)
+	}
+}
+
+// solutionBetween returns a solution meeting lo but not hi leading zero bits.
+func solutionBetween(tok string, lo, hi int) string {
+	for i := 0; ; i++ {
+		s := strconv.Itoa(i)
+		if z := leadingZeroBits(tok, s); z >= lo && z < hi {
+			return s
+		}
+	}
+}
+
+func TestSolveAtThePreviousDifficultyIsStaleDifficulty(t *testing.T) {
+	tok := IssueChallenge("h-secret", "203.0.113.5", "/", time.Now().Add(challengeTokenTTL))
+	form := url.Values{"challenge": {tok}, "solution": {solutionBetween(tok, 8, 12)}}
+
+	raised := &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 12, vp: "/__apx_challenge/verify", prev: 8}}
+	r := verifyReq(form, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
+	_, reason := outcomeAndReason(r)
+	require.Equal(t, reasonStaleDifficulty, reason)
+
+	// No recent change: the same short proof is a wrong proof.
+	steady := &ChallengeHandler{app: fakeApp{sec: "h-secret", diff: 12, vp: "/__apx_challenge/verify"}}
+	r = verifyReq(form, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusForbidden, serveReq(t, steady, r).Code)
+	_, reason = outcomeAndReason(r)
+	require.Equal(t, reasonProof, reason)
+
+	// A proof that meets neither is a wrong proof even right after a change.
+	r = verifyReq(url.Values{"challenge": {tok}, "solution": {failingSolution(tok, 8)}}, "203.0.113.5", "UA")
+	require.Equal(t, http.StatusForbidden, serveReq(t, raised, r).Code)
+	_, reason = outcomeAndReason(r)
+	require.Equal(t, reasonProof, reason)
+}
+
+func TestDifficultyHistory(t *testing.T) {
+	d := &difficultyHistory{}
+	now := time.Now()
+	d.record(16, now)
+	d.record(16, now) // a reload with the same difficulty is no change
+	require.Equal(t, 0, d.previousAt(now))
+	d.record(18, now)
+	require.Equal(t, 16, d.previousAt(now.Add(staleDifficultyWindow)))
+	require.Equal(t, 0, d.previousAt(now.Add(staleDifficultyWindow+time.Second)))
+
+	// Provision records each config's difficulty.
+	h := &difficultyHistory{}
+	for _, diff := range []int{14, 20} {
+		app := &ChallengeApp{SecretCfg: "s", DifficultyCfg: diff, difficulties: h}
+		require.NoError(t, app.Provision(caddy.Context{}))
+	}
+	app := &ChallengeApp{SecretCfg: "s", DifficultyCfg: 20, difficulties: h}
+	require.NoError(t, app.Provision(caddy.Context{}))
+	require.Equal(t, 14, app.PreviousDifficulty(time.Now()))
 }

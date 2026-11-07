@@ -52,6 +52,10 @@ type cookiePayload struct {
 	Prefix string `json:"p"`
 	Iat    int64  `json:"i,omitempty"`
 	UA     string `json:"u,omitempty"`
+	// Fallback marks a cookie earned through the render-check fallback, not a
+	// proof-of-work solve. Older images ignore the key and accept the cookie;
+	// cookies without it (all older ones) are solved cookies.
+	Fallback bool `json:"f,omitempty"`
 }
 
 // PassPolicy controls pass-cookie lifetime and binding. DefaultPassPolicy is
@@ -81,6 +85,8 @@ func (pol PassPolicy) Rolling() bool { return pol.MaxTTL > pol.IdleTTL }
 type PassCookie struct {
 	Exp      time.Time
 	IssuedAt time.Time
+	// Fallback is true for a cookie earned through the render-check fallback.
+	Fallback bool
 }
 
 // InitialExp is the expiry of a cookie minted at now for a challenge issued at
@@ -257,8 +263,14 @@ func VerifyCookie(secret, cookie, ip string) bool {
 // challenge's issue time) is recorded only when pol is rolling, and the UA
 // hash only when pol binds the User-Agent.
 func IssuePassCookie(secret string, pol PassPolicy, ip, ua string, issuedAt, exp time.Time) string {
+	return issuePassCookie(secret, pol, ip, ua, issuedAt, exp, false)
+}
+
+// issuePassCookie is IssuePassCookie that also records whether the cookie was
+// earned through the render-check fallback.
+func issuePassCookie(secret string, pol PassPolicy, ip, ua string, issuedAt, exp time.Time, fallback bool) string {
 	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
-	p := cookiePayload{Exp: exp.Unix(), Prefix: pref}
+	p := cookiePayload{Exp: exp.Unix(), Prefix: pref, Fallback: fallback}
 	if pol.Rolling() {
 		p.Iat = issuedAt.Unix()
 	}
@@ -293,7 +305,7 @@ func VerifyPassCookie(secret string, pol PassPolicy, cookie, ip, ua string, now 
 	if pol.BindUserAgent && !hmac.Equal([]byte(p.UA), []byte(uaHash(ua))) {
 		return PassCookie{}, false
 	}
-	pc := PassCookie{Exp: time.Unix(p.Exp, 0)}
+	pc := PassCookie{Exp: time.Unix(p.Exp, 0), Fallback: p.Fallback}
 	if p.Iat != 0 {
 		if pol.Rolling() && now.Unix() > p.Iat+int64(pol.MaxTTL/time.Second) {
 			return PassCookie{}, false

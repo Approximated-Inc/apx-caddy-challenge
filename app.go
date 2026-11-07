@@ -2,6 +2,7 @@ package apxchallenge
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -35,6 +36,9 @@ type AppRef interface {
 	Fallback() FallbackConfig
 	// FallbackState is the process-wide rendered-nonce set and pass budget.
 	FallbackState() *FallbackState
+	// PreviousDifficulty is the PoW difficulty in force before the last
+	// change, while a page issued under it may still be verified; else 0.
+	PreviousDifficulty(now time.Time) int
 }
 
 // ChallengeApp is the top-level Caddy app holding the per-cluster challenge
@@ -108,6 +112,8 @@ type ChallengeApp struct {
 	replayLRU        *NonceLRU
 	passPolicy       PassPolicy
 	fallback         FallbackConfig
+	// difficulties is processDifficulties unless a test injects its own.
+	difficulties *difficultyHistory
 }
 
 // defaultReplayLRUSize bounds the per-machine seen-nonce set. Best-effort
@@ -143,6 +149,10 @@ func (a *ChallengeApp) Provision(ctx caddy.Context) error {
 	if a.secret == "" {
 		return fmt.Errorf("apx_challenge app: secret is required (config key \"secret\")")
 	}
+	if a.difficulties == nil {
+		a.difficulties = processDifficulties
+	}
+	a.difficulties.record(a.difficulty, time.Now())
 
 	if a.verifyDifficulty = a.VerifyDifficultyCfg; a.verifyDifficulty <= 0 {
 		a.verifyDifficulty = 14
@@ -244,6 +254,47 @@ func (a *ChallengeApp) ReplayLRU() *NonceLRU          { return a.replayLRU }
 func (a *ChallengeApp) PassPolicy() PassPolicy        { return a.passPolicy }
 func (a *ChallengeApp) Fallback() FallbackConfig      { return a.fallback }
 func (a *ChallengeApp) FallbackState() *FallbackState { return processFallbackState }
+
+func (a *ChallengeApp) PreviousDifficulty(now time.Time) int {
+	return a.difficulties.previousAt(now)
+}
+
+// staleDifficultyWindow is how long after a difficulty change a solve at the
+// previous difficulty is still recognised: the challenge token's life plus
+// time for the config to reach every machine.
+const staleDifficultyWindow = 2 * challengeTokenTTL
+
+// difficultyHistory remembers the PoW difficulty in force before the last
+// change on this machine. Challenge tokens do not carry their difficulty (the
+// default-policy token is byte-identical to the original format), so a page
+// issued just before a config reload raised it would otherwise fail its solve
+// as a wrong proof. It lives at process level, like the replay set, so a
+// reload keeps it.
+type difficultyHistory struct {
+	mu                sync.Mutex
+	current, previous int
+	changedAt         time.Time
+}
+
+var processDifficulties = &difficultyHistory{}
+
+func (d *difficultyHistory) record(difficulty int, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.current != 0 && d.current != difficulty {
+		d.previous, d.changedAt = d.current, now
+	}
+	d.current = difficulty
+}
+
+func (d *difficultyHistory) previousAt(now time.Time) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.previous == 0 || now.Sub(d.changedAt) > staleDifficultyWindow {
+		return 0
+	}
+	return d.previous
+}
 
 var (
 	_ caddy.App         = (*ChallengeApp)(nil)

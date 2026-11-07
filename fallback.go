@@ -388,19 +388,23 @@ func (h *ChallengeHandler) fallbackFailure(r *http.Request, p fallbackPayload, n
 }
 
 // fallbackFailureReason maps a fallbackFailure result to the reason recorded
-// with the failed outcome: a missing cookie, a missing render or a POST before
-// the dwell is a failed render check; a spent nonce is a replay; the hourly
-// budget is its own, neutral, reason.
+// with the failed outcome. Each has an ordinary browser cause: a fifth tab
+// drops a nonce from the cookie, the pixel loaded on another machine, a
+// double-clicked Continue spends the nonce twice.
 func fallbackFailureReason(failure string) string {
 	switch failure {
 	case "":
 		return ""
+	case "cookie":
+		return reasonRenderCookie
+	case "not_rendered":
+		return reasonRenderPixel
+	case "too_fast":
+		return reasonRenderDwell
 	case "replayed":
-		return reasonReplay
-	case "rate_limited":
+		return reasonFallbackReplay
+	default: // "rate_limited"
 		return reasonFallbackLimit
-	default:
-		return reasonRender
 	}
 }
 
@@ -424,7 +428,7 @@ func (h *ChallengeHandler) handleFallbackVerify(w http.ResponseWriter, r *http.R
 	fpol := pol
 	fpol.IdleTTL, fpol.MaxTTL = h.app.Fallback().PassTTL, h.app.Fallback().PassTTL
 	exp := fpol.InitialExp(now, now)
-	setPassCookie(w, IssuePassCookie(h.app.Secret(), fpol, ip, r.UserAgent(), time.Time{}, exp), exp, now)
+	setPassCookie(w, issuePassCookie(h.app.Secret(), fpol, ip, r.UserAgent(), time.Time{}, exp, true), exp, now)
 	setFallbackCookie(w, h.app.Secret(), withoutNonce(readFallbackNonces(r, h.app.Secret()), p.Nonce))
 	setOutcome(r, "passed_fallback")
 	return h.verifyPassed(w, r, safeReturn(p.Ret))
