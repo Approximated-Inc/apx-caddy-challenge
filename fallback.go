@@ -131,18 +131,25 @@ type fallbackPayload struct {
 	Prefix string `json:"p"`
 	Ret    string `json:"r"`
 	UA     string `json:"u,omitempty"`
+	// Source and Addr as in ChallengePayload.
+	Source string `json:"s,omitempty"`
+	Addr   string `json:"a,omitempty"`
 }
 
 // issueFallbackToken mints a fallback form token bound to the pass policy's
 // prefix width (and UA hash under UA binding), and returns it with its nonce.
-func issueFallbackToken(secret string, pol PassPolicy, ip, ua, ret string, now time.Time) (string, string) {
+func issueFallbackToken(secret string, pol PassPolicy, ip, ua, ret string, now time.Time, source string) (string, string) {
 	nb := make([]byte, 12)
 	_, _ = rand.Read(nb)
 	nonce := base64.RawURLEncoding.EncodeToString(nb)
-	return issueFallbackTokenNonce(secret, pol, ip, ua, ret, now, nonce), nonce
+	return issueFallbackTokenNonceSource(secret, pol, ip, ua, ret, now, nonce, source), nonce
 }
 
 func issueFallbackTokenNonce(secret string, pol PassPolicy, ip, ua, ret string, now time.Time, nonce string) string {
+	return issueFallbackTokenNonceSource(secret, pol, ip, ua, ret, now, nonce, "")
+}
+
+func issueFallbackTokenNonceSource(secret string, pol PassPolicy, ip, ua, ret string, now time.Time, nonce, source string) string {
 	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	p := fallbackPayload{
 		Exp:    now.Add(fallbackTokenTTL).Unix(),
@@ -153,6 +160,9 @@ func issueFallbackTokenNonce(secret string, pol PassPolicy, ip, ua, ret string, 
 	}
 	if pol.BindUserAgent {
 		p.UA = uaHash(ua)
+	}
+	if source != "" {
+		p.Source, p.Addr = source, tokenAddr(ip)
 	}
 	body, _ := json.Marshal(p)
 	return encodeSigned(secret, fallbackDomain, body)
@@ -413,8 +423,10 @@ func fallbackFailureReason(failure string) string {
 // path as a failed solve.
 func (h *ChallengeHandler) handleFallbackVerify(w http.ResponseWriter, r *http.Request, ip string) error {
 	pol, now := h.app.PassPolicy(), time.Now()
-	p, err := verifyFallbackToken(h.app.Secret(), pol, r.FormValue("fallback"), ip, r.UserAgent(), now)
+	token := r.FormValue("fallback")
+	p, err := verifyFallbackToken(h.app.Secret(), pol, token, ip, r.UserAgent(), now)
 	reason := tokenFailureReason(err)
+	src := h.verifySource(err, p.Source, p.Addr, fallbackDomain, token, ip)
 	if err == nil {
 		reason = fallbackFailureReason(h.fallbackFailure(r, p, now))
 	}
@@ -423,14 +435,14 @@ func (h *ChallengeHandler) handleFallbackVerify(w http.ResponseWriter, r *http.R
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		return h.verifyFailed(w, r, ret, reason)
+		return h.verifyFailed(w, r, ret, reason, src)
 	}
 	fpol := pol
 	fpol.IdleTTL, fpol.MaxTTL = h.app.Fallback().PassTTL, h.app.Fallback().PassTTL
 	exp := fpol.InitialExp(now, now)
 	setPassCookie(w, issuePassCookie(h.app.Secret(), fpol, ip, r.UserAgent(), time.Time{}, exp, true), exp, now)
 	setFallbackCookie(w, h.app.Secret(), withoutNonce(readFallbackNonces(r, h.app.Secret()), p.Nonce))
-	setOutcome(r, "passed_fallback")
+	setOutcome(r, "passed_fallback", src)
 	return h.verifyPassed(w, r, safeReturn(p.Ret))
 }
 

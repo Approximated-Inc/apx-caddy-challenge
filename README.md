@@ -66,6 +66,48 @@ Other passes set no reason. A pass cookie earned through the fallback carries
 ignore the key and accept the cookie; cookies without it, including every
 cookie minted by an older image, are treated as solved.
 
+### Source attribution
+
+Every outcome also sets the `apx_challenge_source` request var, which says
+who rendered the challenge the outcome belongs to. apx-caddy-stats reads it
+with the other two vars. The handler takes it from its optional `source`
+config key, which the app emits per route only on images that have this
+capability (an older plugin rejects the key).
+
+| Value | Meaning |
+|---|---|
+| `automatic` | A Defense restriction whose rule owner is automatic |
+| `staff` | A Defense restriction owned by staff or the system |
+| `customer` | A Defense restriction owned by the customer |
+| `edge_sequence` | An Edge Sequence `Challenge` action |
+| `reputation` | The reputation module's embedded challenge |
+| `unknown` | Attribution is not provable (see below) |
+
+An unrecognised configured value is recorded as `unknown` with one warning.
+It never fails Provision, because a config the plugin rejects freezes the
+cluster. The shared verify route has no `source`.
+
+Route outcomes (`issued`, `not_shown_*`, `passed_recently*`) carry the
+route's source, `unknown` on a route without one. The verify route never uses
+its own source. It reads the source from the signed token instead:
+
+- A route with a source adds two keys to the signed challenge and fallback
+  token bodies: `"s"` (the source) and `"a"` (the exact client address the
+  page was issued to). A route without a source mints the same bytes as
+  before, so the shared verify route's own pages are unchanged. The signature
+  covers both keys.
+- A verified token's source counts only when its `a` equals the requester's
+  address (parsed addresses are compared, so an IPv4-mapped form matches).
+  Tokens bind to a /24 or /64 network, so without this a token issued to one
+  address could be posted from another in the same network and attribute
+  failures to an address no rule served. That outcome is recorded as `unknown`.
+- An expired token whose signature verifies keeps its source under the same
+  address rule. `failed_binding` is always `unknown`, as are a missing,
+  malformed or forged token and a token minted by an image without this
+  capability.
+- Older images ignore the extra keys, so a new token verifies on an old
+  machine, which records no source.
+
 Known limits:
 
 - **Mixed images.** A fallback cookie minted by an older machine has no `f`, so
