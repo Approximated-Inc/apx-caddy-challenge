@@ -428,12 +428,13 @@ func isBrowserFormPost(r *http.Request) bool {
 	return err == nil && mt == "application/x-www-form-urlencoded"
 }
 
-// setOutcome sets the outcome and its source. The source is set on every
-// outcome so a second handler in the same request overwrites all three vars
-// together and never leaves a stale one.
+// setOutcome sets the outcome and its source and clears the reason. All three
+// vars are written on every outcome, so a second handler in the same request
+// never leaves a stale one (an earlier failure's reason beside a later pass).
 func setOutcome(r *http.Request, outcome, source string) {
 	caddyhttp.SetVar(r.Context(), outcomeVarKey, outcome)
 	caddyhttp.SetVar(r.Context(), sourceVarKey, source)
+	caddyhttp.SetVar(r.Context(), reasonVarKey, nil) // nil deletes the var
 }
 
 // setOutcomeReason sets the outcome, its source and the reason recorded beside it.

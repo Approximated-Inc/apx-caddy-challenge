@@ -566,3 +566,20 @@ func TestStrictConfigAcceptsSource(t *testing.T) {
 	var bad ChallengeHandler
 	require.Error(t, caddy.StrictUnmarshalJSON([]byte(`{"sourc":"automatic"}`), &bad))
 }
+
+func TestSecondHandlerOverwritesAllThreeVars(t *testing.T) {
+	// One request through two handlers: the first fails with a reason, the
+	// second passes on a pass cookie. The pass must not keep the reason or source.
+	r := browserReq("/page")
+	r.Header.Set("Accept", "application/json")
+	serveReq(t, srcHandler(sourceAutomatic), r)
+	require.Equal(t, "failed", outcomeOfVar(r))
+	require.Equal(t, reasonAPI, reasonOfVar(r))
+	require.Equal(t, sourceAutomatic, srcVar(r))
+
+	r.AddCookie(&http.Cookie{Name: CookieName, Value: IssueCookie("h-secret", srcIP, timeNowPlus10())})
+	serveReq(t, srcHandler(sourceEdgeSequence), r)
+	require.Equal(t, "passed_recently", outcomeOfVar(r))
+	require.Nil(t, reasonOfVar(r), "the earlier failure's reason is cleared")
+	require.Equal(t, sourceEdgeSequence, srcVar(r))
+}
