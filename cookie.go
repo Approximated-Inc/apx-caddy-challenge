@@ -33,6 +33,11 @@ type ChallengePayload struct {
 	UA string `json:"u,omitempty"`
 	// Iat is the issue time, present only under a non-default pass policy.
 	Iat int64 `json:"i,omitempty"`
+	// Source is who rendered the page this token came with, and Addr the exact
+	// client address it was issued to. Both are present only when the route has
+	// a source, and both are covered by the signature.
+	Source string `json:"s,omitempty"`
+	Addr   string `json:"a,omitempty"`
 }
 
 // IssuedAt is the token's issue time: Iat when present, else exp - ttl (every
@@ -210,7 +215,19 @@ func IssuePassChallenge(secret string, pol PassPolicy, ip, ua, ret string, exp t
 	return issueChallengeNonce(secret, pol, ip, ua, ret, time.Now(), exp, base64.RawURLEncoding.EncodeToString(nb))
 }
 
+// issuePassChallengeSource is IssuePassChallenge that records source (and the
+// address) in the token. An empty source mints the exact pre-source token.
+func issuePassChallengeSource(secret string, pol PassPolicy, ip, ua, ret string, exp time.Time, source string) string {
+	nb := make([]byte, 12)
+	_, _ = rand.Read(nb)
+	return issueChallengeNonceSource(secret, pol, ip, ua, ret, time.Now(), exp, base64.RawURLEncoding.EncodeToString(nb), source)
+}
+
 func issueChallengeNonce(secret string, pol PassPolicy, ip, ua, ret string, now, exp time.Time, nonce string) string {
+	return issueChallengeNonceSource(secret, pol, ip, ua, ret, now, exp, nonce, "")
+}
+
+func issueChallengeNonceSource(secret string, pol PassPolicy, ip, ua, ret string, now, exp time.Time, nonce, source string) string {
 	pref, _ := clientPrefixWidth(ip, pol.IPv4Prefix, pol.IPv6Prefix)
 	p := ChallengePayload{Exp: exp.Unix(), Nonce: nonce, Prefix: pref, Ret: ret}
 	if pol != DefaultPassPolicy() {
@@ -218,6 +235,9 @@ func issueChallengeNonce(secret string, pol PassPolicy, ip, ua, ret string, now,
 	}
 	if pol.BindUserAgent {
 		p.UA = uaHash(ua)
+	}
+	if source != "" {
+		p.Source, p.Addr = source, tokenAddr(ip)
 	}
 	body, _ := json.Marshal(p)
 	return encodeSigned(secret, challengeDomain, body)

@@ -1,6 +1,7 @@
 package apxchallenge
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"mime"
@@ -20,7 +21,83 @@ const (
 	challengeTokenTTL = 5 * time.Minute
 	outcomeVarKey     = "apx_challenge_outcome"
 	reasonVarKey      = "apx_challenge_reason"
+	sourceVarKey      = "apx_challenge_source"
 )
+
+// Sources recorded in apx_challenge_source beside every outcome. The app sets
+// the first five per route (handler config "source"). sourceUnknown is
+// the plugin's own value for an outcome it cannot attribute.
+const (
+	sourceAutomatic    = "automatic"
+	sourceStaff        = "staff"
+	sourceCustomer     = "customer"
+	sourceEdgeSequence = "edge_sequence"
+	sourceReputation   = "reputation"
+	sourceUnknown      = "unknown"
+)
+
+// knownSource reports whether s is a value a route may be configured with.
+func knownSource(s string) bool {
+	switch s {
+	case sourceAutomatic, sourceStaff, sourceCustomer, sourceEdgeSequence, sourceReputation, sourceUnknown:
+		return true
+	}
+	return false
+}
+
+// normalizeSource maps any non-recognised value, the empty string included,
+// to sourceUnknown.
+func normalizeSource(s string) string {
+	if knownSource(s) {
+		return s
+	}
+	return sourceUnknown
+}
+
+// tokenAddr formats ip as a token's "a" claim, or "" when ip is not an address.
+func tokenAddr(ip string) string {
+	if p := net.ParseIP(ip); p != nil {
+		return p.String()
+	}
+	return ""
+}
+
+// addrMatches reports whether a token's "a" claim names the requester's exact
+// address. Parsed addresses are compared, so an IPv4-mapped form matches.
+func addrMatches(claimed, ip string) bool {
+	c, r := net.ParseIP(claimed), net.ParseIP(ip)
+	return c != nil && r != nil && c.Equal(r)
+}
+
+// attributedSource is the source a verified token's claims earn the requester:
+// the token's own source when it was issued to this exact address, else unknown
+// (a token from an older image, or replayed from another address in the same
+// client prefix).
+func attributedSource(claimedSource, claimedAddr, ip string) string {
+	if !addrMatches(claimedAddr, ip) {
+		return sourceUnknown
+	}
+	return normalizeSource(claimedSource)
+}
+
+// authenticClaims reads the source and address claims of a token whose
+// signature verifies even though it is expired, and applies the address rule.
+// Anything that does not verify is unknown. The signature is re-checked here
+// so this costs a second HMAC on the expired path only.
+func authenticClaims(secret, domain, token, ip string) string {
+	body, err := splitVerify(secret, domain, token)
+	if err != nil {
+		return sourceUnknown
+	}
+	var c struct {
+		S string `json:"s"`
+		A string `json:"a"`
+	}
+	if json.Unmarshal(body, &c) != nil {
+		return sourceUnknown
+	}
+	return attributedSource(c.S, c.A, ip)
+}
 
 // Reasons recorded in apx_challenge_reason beside an issued or failed outcome.
 // apx-caddy-stats composes them into the stored outcome (issued_document,
@@ -48,6 +125,10 @@ const (
 // ChallengeHandler serves the PoW challenge / verifies solutions. Invoked by the
 // per-dimension challenge routes (and the verify route) Phoenix emits.
 type ChallengeHandler struct {
+	// Source names who rendered this route: automatic | staff | customer |
+	// edge_sequence | reputation. Empty on the shared verify route.
+	Source string `json:"source,omitempty"`
+
 	logger *zap.Logger
 	app    AppRef
 	// difficulties is processDifficulties unless a test injects its own.
@@ -73,6 +154,19 @@ func (h *ChallengeHandler) staleDifficulty(challenge, solution string) bool {
 	return false
 }
 
+// routeSource is the source this route records: its configured one, unknown on
+// the shared verify route and for an unrecognised value.
+func (h *ChallengeHandler) routeSource() string { return normalizeSource(h.Source) }
+
+// tokenSource is the source minted into tokens: "" (no claims) on a route
+// with none, so its tokens stay byte-identical to the pre-source format.
+func (h *ChallengeHandler) tokenSource() string {
+	if h.Source == "" {
+		return ""
+	}
+	return normalizeSource(h.Source)
+}
+
 func (*ChallengeHandler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.apx_challenge",
@@ -82,6 +176,12 @@ func (*ChallengeHandler) CaddyModule() caddy.ModuleInfo {
 
 func (h *ChallengeHandler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
+	// A config the plugin rejects freezes the cluster, so an unrecognised
+	// value is recorded as unknown, never an error.
+	if h.Source != "" && !knownSource(h.Source) {
+		h.logger.Warn("apx_challenge: unrecognised source, recording unknown", zap.String("source", h.Source))
+		h.Source = sourceUnknown
+	}
 	if h.app == nil {
 		app, err := ctx.App("apx_challenge")
 		if err != nil {
@@ -100,6 +200,7 @@ func (h *ChallengeHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { re
 
 func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := clientIP(r)
+	src := h.routeSource()
 
 	if r.Method == http.MethodPost && r.URL.Path == h.app.VerifyPath() {
 		return h.handleVerify(w, r, ip)
@@ -115,9 +216,9 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 				setPassCookie(w, issuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), pc.IssuedAt, exp, pc.Fallback), exp, now)
 			}
 			if pc.Fallback {
-				setOutcomeReason(r, "passed_recently", reasonFallback)
+				setOutcomeReason(r, "passed_recently", reasonFallback, src)
 			} else {
-				setOutcome(r, "passed_recently")
+				setOutcome(r, "passed_recently", src)
 			}
 			clearTriesCookie(w, r) // apx-challenge-failure-states: pass cookie works, reset the loop breaker
 			// valid proof — forward to this route's upstream (the reverse_proxy after this terminal handler)
@@ -126,13 +227,13 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	if isWebSocketOrSSE(r) {
-		setOutcomeReason(r, "failed", reasonStream)
+		setOutcomeReason(r, "failed", reasonStream, src)
 		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return nil
 	}
 	if isLikelyAPIClient(r) {
-		setOutcomeReason(r, "failed", reasonAPI)
+		setOutcomeReason(r, "failed", reasonAPI, src)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"error":"challenge_required","retry_after":30}`))
@@ -140,18 +241,18 @@ func (h *ChallengeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 	}
 
 	if r.Method != http.MethodHead && isLikelyDocument(r) && !isPrefetch(r) {
-		setOutcomeReason(r, "issued", reasonDocument)
+		setOutcomeReason(r, "issued", reasonDocument, src)
 	} else {
-		setOutcomeReason(r, "issued", reasonOther)
+		setOutcomeReason(r, "issued", reasonOther, src)
 	}
 	now := time.Now()
 	ret := safeReturn(r.URL.RequestURI())
-	tok := IssuePassChallenge(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now.Add(challengeTokenTTL))
+	tok := issuePassChallengeSource(h.app.Secret(), h.app.PassPolicy(), ip, r.UserAgent(), ret, now.Add(challengeTokenTTL), h.tokenSource())
 	h.history().issued(h.app.Difficulty())
 	var fb *fallbackView
 	if h.app.Fallback().Enabled && isLikelyDocument(r) {
 		pol := h.app.PassPolicy()
-		ftok, nonce := issueFallbackToken(h.app.Secret(), pol, ip, r.UserAgent(), ret, now)
+		ftok, nonce := issueFallbackToken(h.app.Secret(), pol, ip, r.UserAgent(), ret, now, h.tokenSource())
 		setFallbackCookie(w, h.app.Secret(), withNonce(readFallbackNonces(r, h.app.Secret()), nonce))
 		pixel := fallbackPixelURL(h.app.Secret(), h.app.VerifyPath(), pol, ip, r.UserAgent(), nonce, now.Add(fallbackTokenTTL).Unix())
 		fb = &fallbackView{Token: ftok, PixelURL: pixel, VerifyPath: h.app.VerifyPath(), Ret: ret}
@@ -175,6 +276,7 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 	pol, now := h.app.PassPolicy(), time.Now()
 	p, err := VerifyPassChallenge(h.app.Secret(), pol, challenge, ip, r.UserAgent(), now)
 	reason := tokenFailureReason(err)
+	src := h.verifySource(err, p.Source, p.Addr, challengeDomain, challenge, ip)
 	switch {
 	case reason != "":
 	case !VerifyPoW(challenge, solution, h.app.Difficulty()):
@@ -194,14 +296,30 @@ func (h *ChallengeHandler) handleVerify(w http.ResponseWriter, r *http.Request, 
 		if err == nil {
 			ret = safeReturn(p.Ret)
 		}
-		return h.verifyFailed(w, r, ret, reason)
+		return h.verifyFailed(w, r, ret, reason, src)
 	}
 	// The cap counts from the challenge's issue, so replaying a token can't reset it.
 	iat := p.IssuedAt(challengeTokenTTL)
 	exp := pol.InitialExp(iat, now)
 	setPassCookie(w, IssuePassCookie(h.app.Secret(), pol, ip, r.UserAgent(), iat, exp), exp, now)
-	setOutcome(r, "passed")
+	setOutcome(r, "passed", src)
 	return h.verifyPassed(w, r, safeReturn(p.Ret))
+}
+
+// verifySource is the source a verify outcome is recorded under, never the
+// verify route's own: a verified token's source when issued to this exact
+// address, an authentic expired token's under the same rule, unknown for a
+// binding failure (the requester is outside the token's network, so never the
+// issued address) and for anything that did not verify.
+func (h *ChallengeHandler) verifySource(err error, tokSource, tokAddr, domain, token, ip string) string {
+	switch {
+	case err == nil:
+		return attributedSource(tokSource, tokAddr, ip)
+	case errors.Is(err, errExpired):
+		return authenticClaims(h.app.Secret(), domain, token, ip)
+	default:
+		return sourceUnknown
+	}
 }
 
 // tokenFailureReason names why a challenge or fallback token did not verify,
@@ -223,8 +341,8 @@ func tokenFailureReason(err error) string {
 // form post, a counted failure in the tries cookie plus a redirect to a fresh
 // challenge at ret (the explanation page at the threshold). reason is recorded
 // beside the failed outcome.
-func (h *ChallengeHandler) verifyFailed(w http.ResponseWriter, r *http.Request, ret, reason string) error {
-	setOutcomeReason(r, "failed", reason)
+func (h *ChallengeHandler) verifyFailed(w http.ResponseWriter, r *http.Request, ret, reason, source string) error {
+	setOutcomeReason(r, "failed", reason, source)
 	if !isBrowserFormPost(r) {
 		w.WriteHeader(http.StatusForbidden)
 		return nil
@@ -310,13 +428,18 @@ func isBrowserFormPost(r *http.Request) bool {
 	return err == nil && mt == "application/x-www-form-urlencoded"
 }
 
-func setOutcome(r *http.Request, outcome string) {
+// setOutcome sets the outcome and its source and clears the reason. All three
+// vars are written on every outcome, so a second handler in the same request
+// never leaves a stale one (an earlier failure's reason beside a later pass).
+func setOutcome(r *http.Request, outcome, source string) {
 	caddyhttp.SetVar(r.Context(), outcomeVarKey, outcome)
+	caddyhttp.SetVar(r.Context(), sourceVarKey, source)
+	caddyhttp.SetVar(r.Context(), reasonVarKey, nil) // nil deletes the var
 }
 
-// setOutcomeReason sets the outcome and the reason recorded beside it.
-func setOutcomeReason(r *http.Request, outcome, reason string) {
-	setOutcome(r, outcome)
+// setOutcomeReason sets the outcome, its source and the reason recorded beside it.
+func setOutcomeReason(r *http.Request, outcome, reason, source string) {
+	setOutcome(r, outcome, source)
 	caddyhttp.SetVar(r.Context(), reasonVarKey, reason)
 }
 
