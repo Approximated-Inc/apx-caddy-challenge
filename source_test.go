@@ -99,12 +99,17 @@ func TestEmptySourceTokenIsByteIdentical(t *testing.T) {
 	require.NotContains(t, string(body), `"a"`)
 
 	now := time.Unix(goldenExpUnix-100, 0)
+	// Frozen from origin/master (9683839) before this change.
+	const masterFallbackToken = "eyJlIjoxODkzNDU2NTAwLCJpIjoxODkzNDU1OTAwMDAwLCJuIjoibiIsInAiOiIyMDMuMC4xMTMuMC8yNCIsInIiOiIveCJ9.qYg1BmF-U27aTlBui8x4SsFQA1jvbwy7rXgGfaElM90"
 	fOld := issueFallbackTokenNonce("s", DefaultPassPolicy(), "203.0.113.5", "UA", "/x", now, "n")
-	require.Equal(t, fOld, issueFallbackTokenNonceSource("s", DefaultPassPolicy(), "203.0.113.5", "UA", "/x", now, "n", ""))
+	require.Equal(t, masterFallbackToken, fOld)
+	require.Equal(t, masterFallbackToken, issueFallbackTokenNonceSource("s", DefaultPassPolicy(), "203.0.113.5", "UA", "/x", now, "n", ""))
 	fBody, err := splitVerify("s", fallbackDomain, fOld)
 	require.NoError(t, err)
-	require.NotContains(t, string(fBody), `"s":"`+sourceAutomatic)
-	require.NotContains(t, string(fBody), `"a"`)
+	var fm map[string]any
+	require.NoError(t, json.Unmarshal(fBody, &fm))
+	require.NotContains(t, fm, "s")
+	require.NotContains(t, fm, "a")
 
 	// A source does change the bytes.
 	require.NotEqual(t, got, issueChallengeNonceSource(goldenSecret, DefaultPassPolicy(), "203.0.113.5", "Mozilla/5.0", "/dash?x=1", time.Now(), exp, "AAAAAAAAAAAAAAAA", sourceAutomatic))
@@ -243,6 +248,17 @@ func TestBindingIsUnknown(t *testing.T) {
 	postFallback(t, fh, fr)
 	require.Equal(t, reasonBinding, reasonOfVar(fr))
 	require.Equal(t, sourceUnknown, srcVar(fr))
+
+	// Fallback token bound to a UA, posted from its own issued address with
+	// another UA: the address matches, so only the binding rule makes it unknown.
+	upol := DefaultPassPolicy()
+	upol.BindUserAgent = true
+	uh, _ := fbHandler(upol, enabledFallback())
+	utok := issueFallbackTokenNonceSource(fbSecret, upol, fbIP, "UA-2", "/x", time.Now(), "nonce", sourceAutomatic)
+	ur := fbPost(fbIP, "UA-1", utok, "/x")
+	postFallback(t, uh, ur)
+	require.Equal(t, reasonBinding, reasonOfVar(ur))
+	require.Equal(t, sourceUnknown, srcVar(ur))
 }
 
 func TestReplayedTokenFromAnotherAddressIsUnknown(t *testing.T) {
